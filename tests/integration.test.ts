@@ -8,8 +8,10 @@ import {
   createReviewDraft,
   createTopic,
   finalizeReviewDraft,
+  getQuizItems,
   getQuizResults,
   getReviewDraft,
+  getResponseGrades,
   getTopicProfile,
   learnerSnapshot,
   patchReviewDraft,
@@ -245,6 +247,277 @@ describe("User-AI-Server integration workflows", () => {
   it("does not expose a parallel questions candidates endpoint", () => {
     // [AI -> Server] Quiz-planning retrieval should use GET /api/questions, not POST /api/questions/candidates.
     expect(existsSync("app/api/questions/candidates/route.ts")).toBe(false);
+  });
+
+  it("models navigation, draft answer revision, submission, and staged AI review without learner-model updates", async () => {
+    // [User -> AI] "Quiz me on compactness."
+    // [AI -> Server] Create topic/questions/quiz.
+    await createTopic({ slug: "answer_pipeline_compactness", title: "Answer Pipeline Compactness", tags: ["topology"] });
+    const definitionQuestion = await createQuestion({
+      slug: "answer_pipeline_compactness_definition",
+      topic_ids: ["answer_pipeline_compactness"],
+      question_tags: ["definition", "open-cover"],
+      modality: "free_response",
+      prompt: "State compactness using open covers."
+    });
+    const exampleQuestion = await createQuestion({
+      slug: "answer_pipeline_compactness_example",
+      topic_ids: ["answer_pipeline_compactness"],
+      question_tags: ["example"],
+      modality: "free_response",
+      prompt: "Give an example of a compact space."
+    });
+    const quiz = await createQuiz({
+      topic_ids: ["answer_pipeline_compactness"],
+      answer_reveal_policy: "after_quiz",
+      question_refs: [
+        { question_id: definitionQuestion.id, order: 1 },
+        { question_id: exampleQuestion.id, order: 2 }
+      ]
+    });
+
+    // [AI -> Server] Navigate from ordered quiz items; no /next endpoint is needed.
+    const itemsBefore = await getQuizItems(quiz.quiz_id);
+    expect(itemsBefore.items).toHaveLength(2);
+    expect(itemsBefore.items[0]?.outcome).toBeNull();
+    expect(itemsBefore.items[1]?.outcome).toBeNull();
+
+    // [AI -> Server] Mark the shown item as no_answer so it differs from never-shown items.
+    const shownDraft = await saveResponseDraft(itemsBefore.items[0]!.quiz_item_id, {
+      outcome: "no_answer",
+      answer_text: null,
+      answer_reveal_policy: "after_quiz"
+    });
+    expect(shownDraft.outcome).toBe("no_answer");
+
+    // [User -> AI] Learner answers, then revises before submission.
+    const firstAnswer = await saveResponseDraft(itemsBefore.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "A space is compact if every open cover has a finite subcover.",
+      answer_reveal_policy: "after_quiz"
+    });
+    const revisedAnswer = await saveResponseDraft(itemsBefore.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "Every open cover of the space has a finite subcover.",
+      answer_reveal_policy: "after_quiz"
+    });
+    expect(revisedAnswer.response_id).toBe(firstAnswer.response_id);
+    expect(revisedAnswer.response_state).toBe("draft");
+
+    const itemsAfterRevision = await getQuizItems(quiz.quiz_id);
+    expect(itemsAfterRevision.items[0]?.outcome).toBe("answered");
+    expect(itemsAfterRevision.items[0]?.response_state).toBe("draft");
+    expect(itemsAfterRevision.items[1]?.response_id).toBeNull();
+
+    // [User -> AI] Learner ends the quiz early.
+    // [AI -> Server] Submit only presented items with saved outcomes.
+    const submitted = await submitQuizResponses(quiz.quiz_id, {
+      idempotency_key: "answer-pipeline-submit",
+      submitted_from: "test"
+    });
+    expect(submitted.status).toBe("responses_submitted");
+    expect(submitted.review_payload).toHaveLength(1);
+    expect(submitted.review_payload[0]?.response.answer_text).toBe("Every open cover of the space has a finite subcover.");
+    expect(submitted.review_payload[0]?.question.prompt).toBe("State compactness using open covers.");
+
+    // [AI -> Server] Draft response edits are locked after submission.
+    await expect(saveResponseDraft(itemsBefore.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "Trying to edit after submit."
+    })).rejects.toThrow(/Cannot edit responses after quiz responses are submitted/);
+
+    // [AI -> AI] Fixture JSON stands in for LLM review/grading.
+    // [AI -> Server] Store staged review draft; this is not final evidence yet.
+    await createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "answer-pipeline-review-draft",
+      summary: {
+        overview: "Correct compactness definition.",
+        strengths: ["Open-cover definition"],
+        weaknesses: []
+      },
+      items: [{
+        response_id: submitted.review_payload[0]!.response_id,
+        outcome: "answered",
+        overall_feedback: "Correct. You included open covers and finite subcovers.",
+        review_rating: "Good",
+        evidence_score: 0.82,
+        strengths: ["Correct formal definition"],
+        weaknesses: [],
+        misconceptions: [],
+        topic_evidence: [{
+          topic_id: "answer_pipeline_compactness",
+          evidence_strength: 0.82,
+          coverage_signal: 0.35
+        }]
+      }]
+    });
+
+    // [UI -> Server] Read draft review and confirm final results are not ready.
+    const draft = await getReviewDraft(quiz.quiz_id);
+    expect(draft.status).toBe("review_drafted");
+    expect(draft.items).toHaveLength(1);
+    expect(draft.items[0]?.review_rating).toBe("Good");
+    const notReadyResults = await getQuizResults(quiz.quiz_id);
+    expect(notReadyResults.results_ready).toBe(false);
+
+    // [Server] No finalization means no immutable grades and no learner-model update.
+    const grades = await getResponseGrades(submitted.review_payload[0]!.response_id);
+    expect(grades.grades).toEqual([]);
+    const profile = await getTopicProfile("answer_pipeline_compactness");
+    expect(profile.knowledge_score).toBe(0);
+    expect(profile.coverage_score).toBe(0);
+  });
+
+  it("models mixed quiz item outcomes and omits never-shown items from the review payload", async () => {
+    // [User -> AI] "Run a mixed outcome quiz."
+    // [AI -> Server] Create a five-item quiz.
+    await createTopic({ slug: "answer_pipeline_mixed", title: "Answer Pipeline Mixed", tags: ["topology"] });
+    const questions = await Promise.all([
+      createQuestion({
+        slug: "mixed_answered",
+        topic_ids: ["answer_pipeline_mixed"],
+        question_tags: ["definition"],
+        modality: "free_response",
+        prompt: "Define an open cover."
+      }),
+      createQuestion({
+        slug: "mixed_skipped",
+        topic_ids: ["answer_pipeline_mixed"],
+        question_tags: ["example"],
+        modality: "free_response",
+        prompt: "Give an example of an open cover."
+      }),
+      createQuestion({
+        slug: "mixed_no_answer",
+        topic_ids: ["answer_pipeline_mixed"],
+        question_tags: ["diagnostic"],
+        modality: "free_response",
+        prompt: "State why compactness asks for finite subcovers."
+      }),
+      createQuestion({
+        slug: "mixed_timed_out",
+        topic_ids: ["answer_pipeline_mixed"],
+        question_tags: ["timed"],
+        modality: "free_response",
+        prompt: "Explain finite subcovers under time pressure."
+      }),
+      createQuestion({
+        slug: "mixed_never_shown",
+        topic_ids: ["answer_pipeline_mixed"],
+        question_tags: ["unused"],
+        modality: "free_response",
+        prompt: "This item should not appear in the review payload."
+      })
+    ]);
+    const quiz = await createQuiz({
+      topic_ids: ["answer_pipeline_mixed"],
+      question_refs: questions.map((question, index) => ({ question_id: question.id, order: index + 1 }))
+    });
+    const items = await getQuizItems(quiz.quiz_id);
+
+    // [User -> AI -> Server] Save mixed presented outcomes.
+    await saveResponseDraft(items.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "A collection of open sets covering the space."
+    });
+    await saveResponseDraft(items.items[1]!.quiz_item_id, {
+      outcome: "skipped",
+      answer_text: null
+    });
+    await saveResponseDraft(items.items[2]!.quiz_item_id, {
+      outcome: "no_answer",
+      answer_text: null
+    });
+    await saveResponseDraft(items.items[3]!.quiz_item_id, {
+      outcome: "timed_out",
+      answer_text: null
+    });
+
+    // [AI -> Server] Submit all presented outcomes; never-shown item is omitted.
+    const submitted = await submitQuizResponses(quiz.quiz_id, {
+      idempotency_key: "mixed-submit",
+      submitted_from: "test"
+    });
+    expect(submitted.review_payload.map((item) => item.response.outcome)).toEqual([
+      "answered",
+      "skipped",
+      "no_answer",
+      "timed_out"
+    ]);
+    expect(submitted.review_payload.map((item) => item.question.prompt)).not.toContain("This item should not appear in the review payload.");
+  });
+
+  it("models safe learner edits on staged AI review feedback without finalizing", async () => {
+    // [User -> AI] "Quiz me, then let me inspect the review draft."
+    // [AI -> Server] Create a quiz, save answer, submit responses, and stage AI review.
+    await createTopic({ slug: "answer_pipeline_review_edits", title: "Answer Pipeline Review Edits", tags: ["topology"] });
+    const question = await createQuestion({
+      slug: "review_edits_open_cover",
+      topic_ids: ["answer_pipeline_review_edits"],
+      question_tags: ["definition"],
+      modality: "free_response",
+      prompt: "Define an open cover."
+    });
+    const quiz = await createQuiz({
+      topic_ids: ["answer_pipeline_review_edits"],
+      question_refs: [{ question_id: question.id, order: 1 }]
+    });
+    const items = await getQuizItems(quiz.quiz_id);
+    const response = await saveResponseDraft(items.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "A collection of open sets that covers the space."
+    });
+    await submitQuizResponses(quiz.quiz_id, {
+      idempotency_key: "review-edits-submit",
+      submitted_from: "test"
+    });
+    await createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "review-edits-draft",
+      summary: { overview: "Mostly correct." },
+      items: [{
+        response_id: response.response_id,
+        outcome: "answered",
+        overall_feedback: "Mostly correct definition.",
+        review_rating: "Good",
+        evidence_score: 0.74,
+        strengths: ["Recognizes cover by open sets"],
+        weaknesses: [],
+        misconceptions: [],
+        topic_evidence: [{
+          topic_id: "answer_pipeline_review_edits",
+          evidence_strength: 0.74,
+          coverage_signal: 0.25
+        }]
+      }]
+    });
+    const draft = await getReviewDraft(quiz.quiz_id);
+    const draftItem = draft.items[0];
+    if (!draftItem) throw new Error("review draft item missing");
+
+    // [Learner -> UI] Add a note and dispute.
+    // [UI -> Server] Save only safe mutable review fields.
+    const patched = await patchReviewDraft(quiz.quiz_id, {
+      items: [{
+        review_draft_item_id: draftItem.review_draft_item_id,
+        overall_feedback: "Feedback text edited for clarity.",
+        learner_note: "I want this checked again.",
+        dispute_reason: "The rating seems too generous.",
+        excluded: false
+      }]
+    });
+    expect(patched.needs_ai_re_review).toBe(true);
+
+    const afterPatch = await getReviewDraft(quiz.quiz_id);
+    expect(afterPatch.items[0]?.overall_feedback).toBe("Feedback text edited for clarity.");
+    expect(afterPatch.items[0]?.learner_note).toBe("I want this checked again.");
+    expect(afterPatch.items[0]?.needs_ai_re_review).toBe(true);
+
+    // [Server] Review edits are staged only. No finalization, grades, or learner-model updates yet.
+    const grades = await getResponseGrades(response.response_id);
+    expect(grades.grades).toEqual([]);
+    const profile = await getTopicProfile("answer_pipeline_review_edits");
+    expect(profile.knowledge_score).toBe(0);
+    expect(profile.coverage_score).toBe(0);
   });
 
   it("models learner review of AI feedback and blocks finalization when re-review is needed", async () => {
