@@ -17,5 +17,24 @@ services:
       timeout: 5s
       retries: 20
 
+  postgres-test:
+    image: pgvector/pgvector:pg16
+    container_name: ai-agent-learning-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: learning
+      POSTGRES_PASSWORD: learning
+      POSTGRES_DB: learning
+    ports:
+      - "54330:5432"
+    volumes:
+      - ai-agent-learning-postgres-test:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U learning -d learning"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   ai-agent-learning-postgres:
+  ai-agent-learning-postgres-test:

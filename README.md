@@ -44,24 +44,27 @@ postgres://learning:learning@localhost:54329/learning
 
 ## Verification
 
-Fast checks:
+Static checks:
 
 ```bash
 pnpm typecheck
-pnpm test
 pnpm build
 ```
 
-Database-backed lifecycle checks:
+Integration workflow checks:
 
 ```bash
-pnpm db:up
-pnpm db:reset
-pnpm db:migrate
-pnpm test:db
+pnpm db:test:up
+pnpm db:test:reset
+pnpm db:test:migrate
+pnpm test
 ```
 
-`pnpm test` skips DB tests by default. `pnpm test:db` enables them with `RUN_DB_TESTS=1`.
+This repo intentionally uses integration tests only. The tests connect to real Postgres on `localhost:54330` and model the `User -> AI -> Server` workflows described in [`docs/design.md`](docs/design.md).
+
+The DB lifecycle tests use fixture JSON for the AI review/grading step. Those fixtures act as the LLM actor in tests: they are deterministic and fast, while still matching the shape of the real end-to-end quiz flow where an AI plans, reviews, and submits feedback through the API.
+
+The development database remains separate on `localhost:54329`, so test resets do not wipe local development data.
 
 ## Backend Rules
 
@@ -76,9 +79,12 @@ pnpm test:db
 
 ```bash
 pnpm db:up       # start pgvector Postgres
+pnpm db:test:up  # start isolated test Postgres on localhost:54330
 pnpm db:down     # stop Postgres
 pnpm db:reset    # drop/recreate public schema
+pnpm db:test:reset # drop/recreate the test public schema
 pnpm db:migrate  # apply SQL migrations
+pnpm db:test:migrate # apply SQL migrations to test Postgres
 pnpm db:seed     # seed local learner, topics, and sample questions
-pnpm test:db     # run DB-backed integration tests
+pnpm test        # run DB-backed User-AI-Server integration tests
 ```

@@ -155,6 +155,54 @@ When changing learning semantics:
 - save `no_answer` as soon as a quiz item is shown, then update that draft if the learner answers
 - respect `answer_reveal_policy`, especially `after_quiz` and `never_in_chat`
 
+When adding tests:
+- write integration tests only; do not add isolated unit tests for helpers or schemas
+- model tests as `User -> AI -> Server` workflow stories from `docs/design.md`
+- use fixture data for the learner/user actions and fixture JSON for the AI actor's planning, review, and grading outputs
+- interact with the real backend persistence layer and real test Postgres, but test product workflows rather than Postgres behavior
+- keep the development and test databases on different ports: dev Postgres uses `localhost:54329`, test Postgres uses `localhost:54330`
+- prefer readable actor-step comments such as `[User -> AI]`, `[AI -> Server]`, and `[Server -> AI]`
+
+Example integration-test shape:
+
+```ts
+it("models a full quiz where the AI uses fixture review JSON and the server updates learner knowledge", async () => {
+  // [User -> AI] "Quiz me on compactness."
+  // [AI -> Server] Create topic/question/quiz.
+  const quiz = await createQuiz(...);
+
+  // [AI -> Server] Mark shown question as no_answer.
+  await saveResponseDraft(item.quiz_item_id, { outcome: "no_answer", answer_text: null });
+
+  // [User -> AI] Learner answers.
+  // [AI -> Server] Save durable draft.
+  const answeredDraft = await saveResponseDraft(item.quiz_item_id, {
+    outcome: "answered",
+    answer_text: "Every open cover has a finite subcover."
+  });
+
+  // [AI -> Server] Submit quiz responses.
+  const submitted = await submitQuizResponses(quiz.quiz_id, ...);
+
+  // [AI -> AI] Fixture JSON stands in for LLM grading/review.
+  // [AI -> Server] Store review draft.
+  await createReviewDraft(quiz.quiz_id, {
+    items: [{
+      response_id: answeredDraft.response_id,
+      review_rating: "Good",
+      evidence_score: 0.82,
+      topic_evidence: [{ topic_id: "compactness", evidence_strength: 0.82, coverage_signal: 0.4 }]
+    }]
+  });
+
+  // [UI -> Server] Finalize, then assert learner model changed.
+  await finalizeReviewDraft(quiz.quiz_id, ...);
+  const profile = await getTopicProfile("compactness");
+
+  expect(profile.knowledge_score).toBeGreaterThan(0);
+});
+```
+
 When in doubt:
 - `quiz-conductor` owns live challenge flow
 - `assessment-reviewer` owns grading and finalization
