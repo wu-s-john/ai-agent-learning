@@ -11,11 +11,39 @@ Core philosophy:
 - The AI interprets, grades, plans quizzes, and infers gaps.
 - Grades and learner-model evidence become immutable after review finalization.
 - Questions may be AI-created and stored as normal active questions; quality is handled later through feedback, edits, or retirement.
+- Questions use flexible `question_tags`; the MVP does not store rubrics.
 - Learners can choose when answers/feedback are revealed in chat with `answer_reveal_policy`.
 
 Primary docs:
 - `docs/design.md`: product goals, architecture, data model, workflows
 - `docs/server-endpoints.md`: API endpoints, request/response shapes, server responsibilities
+- `docs/ui-design.md`: Next.js page design, UI navigation, graph visualization, dashboard layout
+
+## UI Navigation
+
+When pointing the learner to a Next.js page, use:
+
+```text
+http://<tailscale-host>:<port>/<path>
+```
+
+Prefer the Tailscale MagicDNS name when available:
+
+```bash
+tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//'
+```
+
+Fallback to the Tailscale IPv4 address:
+
+```bash
+tailscale ip -4
+```
+
+Example:
+
+```text
+http://my-mac.tailnet-name.ts.net:3000/quizzes/quiz_001/results
+```
 
 ## Skill Directory
 
@@ -91,6 +119,23 @@ Main endpoints:
 - `DELETE /api/topic-edges/:edgeId`
 - optional `GET /api/references?q=...&limit=...`
 
+### `react-flow`
+
+Use for React Flow graph UI work:
+- rendering the `/topics/:topicId` topic graph
+- building custom topic nodes and graph edges
+- styling learner-state overlays on nodes
+- wiring graph interactivity, side panels, and layout
+- debugging React Flow canvas, handle, edge, or performance issues
+
+Main use cases:
+- import from `@xyflow/react`
+- render topic graph nodes colored by `knowledge_score`
+- style node border or opacity by `coverage_score`
+- show badges for due/review-needed state
+- show warning indicators for active misconceptions
+- style edges by `prereq_of`, `part_of`, and `related_to`
+
 ## Operating Rules
 
 Before making architectural changes, check both design docs.
@@ -104,7 +149,10 @@ When changing learning semantics:
 - preserve the dumb-server / smart-AI split
 - keep learner-model updates deterministic at finalization time
 - do not let learner-edited ratings directly become mastery evidence
+- generate and preserve useful question tags when creating questions
+- do not depend on stored rubrics in the MVP
 - keep skipped, no-answer, timed-out, and abandoned outcomes distinct from never-presented quiz items
+- save `no_answer` as soon as a quiz item is shown, then update that draft if the learner answers
 - respect `answer_reveal_policy`, especially `after_quiz` and `never_in_chat`
 
 When in doubt:

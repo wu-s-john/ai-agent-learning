@@ -54,7 +54,7 @@ Use this schema consistently in review drafts:
 
 Input is the `review_payload` from `POST /api/quizzes/:quizId/responses/submit`.
 
-1. Grade each submitted item using the question, rubric/answer key, modality, outcome, and learner response.
+1. Grade each submitted item using the question prompt, linked topics, question tags, optional answer key, modality, outcome, and learner response.
 2. Include skipped, no-answer, timed-out, and abandoned outcomes in the review draft.
 3. Create a top-level summary with `overview`, `strengths`, `weaknesses`, and `improvement_targets`.
 4. Store staged evidence with `POST /api/quizzes/:quizId/review-draft`.

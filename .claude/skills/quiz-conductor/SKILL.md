@@ -74,7 +74,7 @@ Rules:
 - Save `answered` with `answer_text` and optional `image_refs`.
 - Save `skipped`, `no_answer`, `timed_out`, or `abandoned` with `answer_text: null`.
 - If the learner asks not to reveal answers until the end, set or preserve `answer_reveal_policy: "after_quiz"`.
-- If `answer_reveal_policy` is `after_quiz` or `never_in_chat`, do not reveal correctness, answer keys, rubrics, or grading feedback during the live chat.
+- If `answer_reveal_policy` is `after_quiz` or `never_in_chat`, do not reveal correctness, answer keys, or grading feedback during the live chat.
 - Do not call grading endpoints during the live quiz.
 - Advance through the ordered quiz item list locally; there is no `/next` endpoint in V1.
 
@@ -92,6 +92,6 @@ Do not finalize or mutate the learner model from this role.
 Keep the learner experience focused:
 - ask one question at a time
 - explain why a question was chosen only when useful
-- avoid revealing rubrics before the learner answers
+- avoid revealing answer keys or grading expectations before the learner answers
 - respect `answer_reveal_policy` exactly
 - do not over-teach unless the learner asks

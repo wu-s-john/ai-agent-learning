@@ -232,22 +232,54 @@ Good embedding targets include:
   - tags
 - questions:
   - prompt
-  - rubric summary
   - linked topic titles
+  - question tags
+  - optional answer-key summary
 - references:
   - title
+  - path or URL
+  - heading
   - snippet
   - document chunk text
 
+Embedding creation should be boring and deterministic:
+1. A searchable object is created or updated.
+2. The server builds a canonical text string for that object.
+3. The server hashes the canonical text plus embedding model.
+4. The server tries to create the embedding synchronously through an embedding adapter.
+5. If embedding succeeds, the vector row is stored.
+6. If embedding fails, the object is still saved and the embedding is marked pending for retry or backfill.
+
+Do not embed every row in V1. Embeddings should be limited to retrieval targets:
+- `topics`
+- `questions`
+- `reference_chunks`
+
+Do not embed these in V1:
+- raw learner responses
+- review drafts
+- grade results
+- topic profiles
+- activity events
+
 This should be implemented as a retrieval layer on top of Postgres, for example with vector storage and similarity indexing, not as a separate reasoning system.
+
+Implementation defaults:
+- use Dockerized Postgres with pgvector for local development
+- use UUID primary keys plus readable slugs for important objects
+- seed one local learner for V1 while keeping `user_id` in learner-owned tables
+- use audit events plus normal relational state tables, not full event sourcing
+- attempt embeddings synchronously with a pending fallback
+- finalize quiz reviews in a single database transaction
 
 ### Core Data Model
 
 Canonical relationships:
 - `Topic` has many tags and graph edges
 - `Question` links to many `Topic` records through `question_topics`
+- `Question` has many flexible `question_tags`
 - `Quiz` has many ordered `QuizItem` records
-- `QuizItem` references one `Question` and stores prompt/rubric snapshots
+- `QuizItem` references one `Question` and stores prompt, answer-key, topic, and tag snapshots
 - `Response` belongs to one `QuizItem` and stores the learner's answer plus item outcome
 - `ReviewDraftItem` belongs to one `Response` and stores staged AI feedback/evidence
 - `GradeResult` belongs to one finalized `ReviewDraftItem`
@@ -330,7 +362,7 @@ A quiz may optionally store assessment context. These fields are metadata for la
 - `time_pressure`
 - `answer_reveal_policy`
 
-`answer_reveal_policy` controls when the AI should reveal correctness, answer keys, rubrics, or feedback in chat:
+`answer_reveal_policy` controls when the AI should reveal correctness, answer keys, or feedback in chat:
 - `after_each_item`: the AI may reveal feedback after each item
 - `after_quiz`: the AI should wait until the quiz is submitted or reviewed
 - `never_in_chat`: the AI should keep answers and feedback out of chat and rely on the review/results UI
@@ -348,9 +380,12 @@ Questions live in a reusable question pool.
 Questions can have:
 - one or more linked topics
 - a modality such as MCQ, free response, or explain-back
-- rubric and answer-key metadata
+- flexible question tags such as `definition`, `proof`, `interview`, `diagnostic`, or `open-cover`
+- optional answer-key metadata for MCQ or exact-answer questions
 - quality and difficulty metadata
 - a status such as `active` or `retired`
+
+V1 does not store rubrics. The AI grades using the question prompt, modality, linked topics, question tags, optional answer key, learner response, and its own domain knowledge.
 
 Question status semantics:
 - `active`: usable question, preferred for reuse
@@ -364,6 +399,8 @@ This matters because one question may:
 - primarily target one topic
 - still depend on or probe nearby topics
 - produce evidence for multiple topics once graded
+
+Questions should also have many-to-many tags through `question_tags`. Tags are not ontology structure; they are flexible retrieval and quiz-planning labels.
 
 #### Responses, Review Drafts, and Grades
 The core answer chain is:
@@ -389,7 +426,7 @@ Quiz item outcomes:
 - `abandoned`: quiz ended while this presented item was still unresolved
 - `excluded`: item should not affect learner-model updates
 
-Only presented items should receive outcomes. Quiz items that were never shown to the learner should remain outcome-less and should not count as evidence.
+When the AI shows a quiz item, it should immediately save a durable draft outcome of `no_answer`. If the learner later answers, skips, times out, or abandons the item, that draft is updated. Quiz items that were never shown to the learner should remain outcome-less and should not count as evidence.
 
 Response states:
 - `draft`: raw answer is durably saved but still editable
@@ -411,7 +448,7 @@ Canonical review evidence schema:
 Cooldown and due logic should be per-user derived state, not a property of the question itself.
 
 Examples:
-- per-user question family review state
+- per-user question review state
 - per-user topic review state
 
 ### Event Ledger and Projections
@@ -548,6 +585,7 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
        {
          "question_id": "q_compact_2",
          "topic_ids": ["compactness", "open_covers"],
+         "question_tags": ["definition", "open-cover"],
          "modality": "free_response",
          "difficulty": 0.58,
          "due": true,
@@ -567,9 +605,8 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
      "modality": "free_response",
      "status": "active",
      "prompt": "Explain why the open-cover definition of compactness is not the same as closed and bounded in every topological space.",
-     "rubric": {
-       "must_cover": ["open cover", "finite subcover", "closed and bounded is metric-space-specific"]
-     }
+     "question_tags": ["definition", "conceptual", "diagnostic"],
+     "answer_key": null
    }
    ```
 10. `[Server -> AI]` Return created question metadata.
@@ -610,7 +647,8 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
           "quiz_item_id": "qi_001",
           "question_id": "q_compact_2",
           "modality": "free_response",
-          "prompt": "State the definition of compactness using open covers."
+          "prompt": "State the definition of compactness using open covers.",
+          "question_tags": ["definition", "open-cover"]
         }
       ]
     }
@@ -624,13 +662,13 @@ The learner can also ask the AI not to reveal answers or feedback in chat until 
 
 If the learner abandons the quiz, draft responses may remain saved, but they are not submitted, graded, or used for the learner model.
 
-1. `[Learner -> AI]` Answer, skip, time out, or abandon the current quiz item.
-2. `[AI -> Server]` Save or update the response draft and item outcome. `POST /api/quiz-items/:quizItemId/response-draft`
+1. `[AI -> Learner]` Present the current quiz item.
+2. `[AI -> Server]` Immediately mark the item as shown but unanswered. `POST /api/quiz-items/:quizItemId/response-draft`
    Body:
    ```json
    {
-     "outcome": "answered",
-     "answer_text": "A space is compact if every open cover has a finite subcover.",
+     "outcome": "no_answer",
+     "answer_text": null,
      "image_refs": [],
      "submitted_from": "chat",
      "answer_reveal_policy": "after_quiz"
@@ -642,15 +680,39 @@ If the learner abandons the quiz, draft responses may remain saved, but they are
      "response_id": "resp_002",
      "quiz_id": "quiz_001",
      "quiz_item_id": "qi_002",
+     "outcome": "no_answer",
+     "response_state": "draft",
+     "answer_reveal_policy": "after_quiz",
+     "quiz_status": "in_progress"
+   }
+   ```
+4. `[Learner -> AI]` Answer, skip, time out, or abandon the current quiz item.
+5. `[AI -> Server]` Update the response draft and item outcome. `POST /api/quiz-items/:quizItemId/response-draft`
+   Body:
+   ```json
+   {
+     "outcome": "answered",
+     "answer_text": "A space is compact if every open cover has a finite subcover.",
+     "image_refs": [],
+     "submitted_from": "chat",
+     "answer_reveal_policy": "after_quiz"
+   }
+   ```
+6. `[Server -> AI]` Return the updated draft response metadata.
+   ```json
+   {
+     "response_id": "resp_002",
+     "quiz_id": "quiz_001",
+     "quiz_item_id": "qi_002",
      "outcome": "answered",
      "response_state": "draft",
      "answer_reveal_policy": "after_quiz",
      "quiz_status": "in_progress"
    }
    ```
-4. `[AI -> Learner]` Present the next quiz item from the AI's local quiz item list. If `answer_reveal_policy` is `after_quiz` or `never_in_chat`, do not reveal correctness, answer keys, rubrics, or grading feedback in chat.
-5. `[Learner -> AI]` Optionally revise an answer before responses are submitted.
-6. `[AI -> Server]` Save the revision through the same response-draft endpoint. `POST /api/quiz-items/:quizItemId/response-draft`
+7. `[AI -> Learner]` Present the next quiz item from the AI's local quiz item list. If `answer_reveal_policy` is `after_quiz` or `never_in_chat`, do not reveal correctness, answer keys, or grading feedback in chat.
+8. `[Learner -> AI]` Optionally revise an answer before responses are submitted.
+9. `[AI -> Server]` Save the revision through the same response-draft endpoint. `POST /api/quiz-items/:quizItemId/response-draft`
    Skip or no-answer outcomes use the same endpoint:
    ```json
    {
@@ -695,9 +757,8 @@ Responses are submitted when the quiz ends naturally or when the learner asks to
            "topic_ids": ["compactness", "open_covers"],
            "modality": "free_response",
            "prompt": "State the definition of compactness using open covers.",
-           "rubric": {
-             "must_cover": ["open cover", "finite subcover"]
-           }
+           "question_tags": ["definition", "topology"],
+           "answer_key": null
          },
          "response": {
            "outcome": "answered",
@@ -952,7 +1013,7 @@ Finalization should reject a review draft if any non-excluded item still has `ne
    }
    ```
 4. `[AI -> Server]` Fetch graph neighbors, topic profiles, learner activity, review state, and optionally question history. `GET /api/topics/:topicId/edges`, `GET /api/topics/:topicId/profile`, `GET /api/activity?topic_id=...&limit=...`, `GET /api/review-items?topic_id=...&limit=...`, optional `GET /api/questions?q=...&topic_id=...&limit=...`
-5. `[Server -> AI]` Return neighboring topics and edge types, topic profiles, recent question-family history, review ratings, and due or nearly due review items.
+5. `[Server -> AI]` Return neighboring topics and edge types, topic profiles, recent question/tag history, review ratings, and due or nearly due review items.
    ```json
    {
      "edges": [
@@ -965,10 +1026,19 @@ Finalization should reject a review draft if any non-excluded item still has `ne
        { "topic_id": "linearizability", "knowledge_score": 0.21, "coverage_score": 0.29 }
      ],
      "activity": [
-       { "question_family_id": "raft_safety", "review_rating": "Again" }
+       {
+         "question_id": "q_raft_safety_1",
+         "question_tags": ["safety", "free-response"],
+         "review_rating": "Again"
+       }
      ],
      "review_items": [
-       { "question_family_id": "raft_log_replication", "due_at": "2026-04-26T18:00:00Z" }
+       {
+         "question_id": "q_raft_log_1",
+         "topic_ids": ["raft", "log_replication"],
+         "question_tags": ["log-replication"],
+         "due_at": "2026-04-26T18:00:00Z"
+       }
      ]
    }
    ```
@@ -1113,7 +1183,11 @@ The server should not generate these recommendations itself.
        "weaknesses": ["log replication details", "safety reasoning"]
      },
      "activity": [
-       { "question_family_id": "raft_quorum_reasoning", "review_rating": "Again" }
+       {
+         "question_id": "q_raft_quorum_1",
+         "question_tags": ["quorum-reasoning"],
+         "review_rating": "Again"
+       }
      ],
      "questions": [
        { "question_id": "q_raft_12", "topic_ids": ["raft", "quorums"] }

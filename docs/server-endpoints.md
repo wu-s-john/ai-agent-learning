@@ -98,12 +98,35 @@ Recommended embedding targets:
   - tags
 - questions:
   - prompt
-  - rubric summary
   - linked topic titles
+  - question tags
+  - optional answer-key summary
 - references:
   - title
+  - path or URL
+  - heading
   - snippet
   - chunked body text
+
+Embedding creation workflow:
+1. A searchable object is created or updated.
+2. The server builds a canonical text string for that object.
+3. The server hashes the canonical text plus embedding model.
+4. The server tries to create the embedding synchronously through an embedding adapter.
+5. If embedding succeeds, the vector row is stored.
+6. If embedding fails, the object is still saved and the embedding is marked pending for retry or backfill.
+
+Embeddings are for retrieval only. In V1, embed:
+- `topics`
+- `questions`
+- `reference_chunks`
+
+Do not embed:
+- raw learner responses
+- review drafts
+- grade results
+- topic profiles
+- activity events
 
 Recommended query flow:
 1. Retrieve exact and alias candidates.
@@ -132,6 +155,8 @@ Suggested implementation with Postgres:
 - use fuzzy matching for titles and aliases
 - use a vector index for nearest-neighbor search
 - keep the returned shape stable even if the ranking internals change later
+- use deterministic fake embeddings in tests
+- keep provider, model, and dimension configurable through environment variables
 
 This pattern applies to:
 - `GET /api/topics?q=...&limit=...`
@@ -175,6 +200,8 @@ Used by AI workflow:
 - `POST /api/quiz-items/:quizItemId/response-draft`
 
 The AI still advances through its local ordered quiz item list, but each answer is saved durably so long quizzes, reloads, or AI restarts do not lose assessment evidence.
+
+When the AI presents a quiz item, it should immediately call the same endpoint with `outcome: "no_answer"` and `answer_text: null`. If the learner answers or skips, that draft is updated.
 
 Main server outputs:
 - response draft and item outcome metadata
@@ -500,8 +527,9 @@ Example response:
   ],
   "review_items": [
     {
-      "question_family_id": "compactness_open_cover_definition",
+      "question_id": "q_compact_2",
       "topic_ids": ["compactness", "open_covers"],
+      "question_tags": ["definition", "open-cover"],
       "due_at": "2026-04-28T18:00:00Z",
       "last_rating": "Hard"
     }
@@ -519,11 +547,13 @@ Return questions filtered by:
 - topic
 - modality
 - status
-- question family
+- question tags
 
 `topic_id` should match through the many-to-many `question_topics` relationship. A single question may belong to multiple topics.
 
 Use this before creating new questions. The server may use hybrid lexical and vector retrieval to return similar existing questions; the AI then decides whether a new disjoint question is needed.
+
+Question tags are flexible retrieval and quiz-planning labels such as `definition`, `proof`, `interview`, `diagnostic`, or `open-cover`. They are not ontology edges.
 
 Example response:
 ```json
@@ -532,6 +562,7 @@ Example response:
     {
       "question_id": "q_compact_2",
       "topic_ids": ["compactness", "open_covers"],
+      "question_tags": ["definition", "open-cover"],
       "modality": "free_response",
       "difficulty": 0.58,
       "quality_score": 0.91,
@@ -551,16 +582,17 @@ Create a reusable question in the pool.
 
 AI-created questions use the same endpoint and status values as any other question. There is no separate generated-question approval lifecycle in V1; if a question later proves confusing or low quality, quiz feedback can lead to editing or retiring it.
 
+V1 questions do not store rubrics. The AI grades using the question prompt, modality, linked topics, question tags, optional answer key, learner response, and its own domain knowledge.
+
 Example request:
 ```json
 {
   "topic_ids": ["compactness", "open_covers"],
+  "question_tags": ["definition", "conceptual", "diagnostic"],
   "modality": "free_response",
   "status": "active",
   "prompt": "Explain why the open-cover definition of compactness is not the same as closed and bounded in every topological space.",
-  "rubric": {
-    "must_cover": ["open cover", "finite subcover", "closed and bounded is metric-space-specific"]
-  }
+  "answer_key": null
 }
 ```
 
@@ -580,6 +612,20 @@ Examples:
 - fix wording
 - retire a bad question
 - update difficulty
+- update question tags
+
+### `POST /api/questions/:questionId/tags`
+Add one or more tags to a question.
+
+Example request:
+```json
+{
+  "tags": ["definition", "interview"]
+}
+```
+
+### `DELETE /api/questions/:questionId/tags/:tag`
+Remove a tag from a question.
 
 ### `POST /api/questions/candidates`
 Optional structured read endpoint for deterministic question retrieval.
@@ -590,6 +636,7 @@ Use when the AI wants candidate questions ranked by deterministic criteria like:
 - cooldown
 - modality
 - question quality
+- question tags
 
 For semantic similarity search, prefer `GET /api/questions?q=...&topic_id=...&limit=...`.
 
@@ -599,6 +646,7 @@ Example request:
   "topic_ids": ["topology", "compactness", "open_sets"],
   "target_topic_ids": ["compactness", "open_sets"],
   "mode": "mixed",
+  "preferred_tags": ["definition", "diagnostic"],
   "limit": 30,
   "include_due": true,
   "include_new": true,
@@ -613,10 +661,10 @@ Example response:
     {
       "question_id": "q_open_1",
       "topic_ids": ["open_sets"],
+      "question_tags": ["definition", "mcq"],
       "modality": "mcq",
       "difficulty": 0.35,
       "due": true,
-      "question_family_id": "open_sets_identification",
       "quality_score": 0.84
     }
   ]
@@ -682,7 +730,8 @@ Example response:
       "quiz_item_id": "qi_001",
       "question_id": "q_compact_2",
       "modality": "free_response",
-      "prompt": "State the definition of compactness using open covers."
+      "prompt": "State the definition of compactness using open covers.",
+      "question_tags": ["definition", "open-cover"]
     }
   ]
 }
@@ -734,6 +783,7 @@ Example response:
       "modality": "free_response",
       "prompt": "State the definition of compactness using open covers.",
       "topic_ids": ["compactness", "open_covers"],
+      "question_tags": ["definition", "open-cover"],
       "outcome": "answered",
       "response_state": "draft"
     },
@@ -744,6 +794,7 @@ Example response:
       "modality": "mcq",
       "prompt": "Which of the following sets is open?",
       "topic_ids": ["open_sets"],
+      "question_tags": ["mcq", "definition"],
       "outcome": null,
       "response_state": null
     }
@@ -813,9 +864,8 @@ Example response:
   "prompt": "State the definition of compactness using open covers.",
   "modality": "free_response",
   "topic_ids": ["compactness", "open_covers"],
-  "rubric": {
-    "must_cover": ["open cover", "finite subcover"]
-  },
+  "question_tags": ["definition", "open-cover"],
+  "answer_key": null,
   "outcome": "answered",
   "response_id": "resp_002",
   "response_state": "draft"
@@ -866,7 +916,20 @@ Allowed `outcome` values:
 - `abandoned`
 - `excluded`
 
-Example request:
+Example shown-but-unanswered request:
+```json
+{
+  "outcome": "no_answer",
+  "answer_text": null,
+  "image_refs": [],
+  "submitted_from": "chat",
+  "answer_reveal_policy": "after_quiz"
+}
+```
+
+The AI should send this when it presents a quiz item. If the learner later answers, skips, times out, or abandons the item, the AI updates the same draft through this endpoint. Quiz items that were never shown should remain outcome-less.
+
+Example answered request:
 ```json
 {
   "outcome": "answered",
@@ -959,9 +1022,8 @@ Example response:
         "topic_ids": ["compactness"],
         "modality": "free_response",
         "prompt": "State the definition of compactness using open covers.",
-        "rubric": {
-          "must_cover": ["open cover", "finite subcover"]
-        }
+        "question_tags": ["definition", "topology"],
+        "answer_key": null
       },
       "response": {
         "outcome": "answered",
@@ -980,7 +1042,7 @@ This is useful for debugging, review UI drill-downs, or AI recovery if it needs 
 Suggested fields:
 - response
 - question
-- rubric or answer key
+- question tags or answer key
 - modality
 - response state
 - outcome
@@ -994,13 +1056,10 @@ Example response:
   "question": {
     "question_id": "q_compact_2",
     "topic_ids": ["compactness"],
+    "question_tags": ["definition", "topology"],
     "modality": "free_response",
     "prompt": "State the definition of compactness using open covers.",
-    "answer_key": null,
-    "rubric": {
-      "must_cover": ["open cover", "finite subcover"],
-      "common_mistakes": ["closed-and-bounded without context"]
-    }
+    "answer_key": null
   },
   "response": {
     "outcome": "answered",
@@ -1245,7 +1304,9 @@ Example response:
 {
   "items": [
     {
-      "question_family_id": "sumcheck_round_invariant",
+      "question_id": "q_sumcheck_round_1",
+      "topic_ids": ["sumcheck"],
+      "question_tags": ["round-invariant"],
       "due_at": "2026-04-26T18:00:00Z",
       "last_rating": "Hard"
     }
@@ -1260,14 +1321,15 @@ This can include:
 - responses
 - grades
 - quiz feedback events
-- question family history
+- question tag history
 
 Example response:
 ```json
 {
   "items": [
     {
-      "question_family_id": "raft_safety",
+      "question_id": "q_raft_safety_1",
+      "question_tags": ["safety", "free-response"],
       "review_rating": "Again",
       "created_at": "2026-04-24T21:00:00Z"
     }
