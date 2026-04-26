@@ -10,6 +10,8 @@ export async function GET(request: Request) {
       status: params.get("status"),
       modality: params.get("modality"),
       tag: params.get("tag"),
+      difficultyTarget: params.has("difficulty_target") ? Number(params.get("difficulty_target")) : null,
+      includeDue: params.get("include_due") !== "false",
       limit: Number(params.get("limit") ?? 20)
     });
   });

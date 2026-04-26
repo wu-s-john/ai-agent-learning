@@ -548,12 +548,28 @@ Return questions filtered by:
 - modality
 - status
 - question tags
+- difficulty target
+- due/review state
 
 `topic_id` should match through the many-to-many `question_topics` relationship. A single question may belong to multiple topics.
 
-Use this before creating new questions. The server may use hybrid lexical and vector retrieval to return similar existing questions; the AI then decides whether a new disjoint question is needed.
+Use this before creating new questions. This is the canonical quiz-planning retrieval endpoint. The server may use hybrid lexical and vector retrieval to return similar existing questions; the AI then decides whether a new disjoint question is needed.
 
 Question tags are flexible retrieval and quiz-planning labels such as `definition`, `proof`, `interview`, `diagnostic`, or `open-cover`. They are not ontology edges.
+
+Retrieval metadata is computed at query time. It explains why a question was returned for this specific query; it is not learner-model evidence and must not update mastery scores.
+
+Example query:
+```json
+{
+  "q": "open cover compactness",
+  "topic_id": "compactness",
+  "tag": "definition",
+  "difficulty_target": 0.6,
+  "include_due": true,
+  "limit": 30
+}
+```
 
 Example response:
 ```json
@@ -568,7 +584,18 @@ Example response:
       "quality_score": 0.91,
       "status": "active",
       "match_type": "vector",
-      "score": 0.87
+      "score": 0.87,
+      "retrieval_score": 0.87,
+      "due": true,
+      "due_at": "2026-04-28T18:00:00Z",
+      "last_rating": "Hard",
+      "retrieval_signals": {
+        "topic_match": true,
+        "tag_overlap": 1,
+        "difficulty_distance": 0.02,
+        "quality_score": 0.91,
+        "due_bonus_applied": true
+      }
     }
   ]
 }
@@ -626,50 +653,6 @@ Example request:
 
 ### `DELETE /api/questions/:questionId/tags/:tag`
 Remove a tag from a question.
-
-### `POST /api/questions/candidates`
-Optional structured read endpoint for deterministic question retrieval.
-
-Use when the AI wants candidate questions ranked by deterministic criteria like:
-- topic match
-- due-ness
-- cooldown
-- modality
-- question quality
-- question tags
-
-For semantic similarity search, prefer `GET /api/questions?q=...&topic_id=...&limit=...`.
-
-Example request:
-```json
-{
-  "topic_ids": ["topology", "compactness", "open_sets"],
-  "target_topic_ids": ["compactness", "open_sets"],
-  "mode": "mixed",
-  "preferred_tags": ["definition", "diagnostic"],
-  "limit": 30,
-  "include_due": true,
-  "include_new": true,
-  "due_bias": 0.3
-}
-```
-
-Example response:
-```json
-{
-  "questions": [
-    {
-      "question_id": "q_open_1",
-      "topic_ids": ["open_sets"],
-      "question_tags": ["definition", "mcq"],
-      "modality": "mcq",
-      "difficulty": 0.35,
-      "due": true,
-      "quality_score": 0.84
-    }
-  ]
-}
-```
 
 ## 4.6 Quizzes
 

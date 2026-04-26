@@ -469,14 +469,25 @@ export async function serializeQuestion(questionId: string, client: DbLike = db)
   };
 }
 
-export async function searchQuestions(query: string | null, filters: { topicId?: string | null; limit?: number; status?: string | null; modality?: string | null; tag?: string | null } = {}) {
+export async function searchQuestions(query: string | null, filters: {
+  topicId?: string | null;
+  limit?: number;
+  status?: string | null;
+  modality?: string | null;
+  tag?: string | null;
+  difficultyTarget?: number | null;
+  includeDue?: boolean;
+} = {}) {
+  const user = await getLocalUser();
   const limit = filters.limit ?? 20;
   const topicId = filters.topicId ? await resolveTopicId(filters.topicId) : null;
+  const includeDue = filters.includeDue ?? true;
   const clauses = [];
-  if (query?.trim()) clauses.push(ilike(questions.prompt, `%${query.trim()}%`));
-  if (filters.status) clauses.push(eq(questions.status, filters.status as "active" | "retired"));
+  const status = filters.status ?? "active";
+  if (status) clauses.push(eq(questions.status, status as "active" | "retired"));
   if (filters.modality) clauses.push(eq(questions.modality, filters.modality as "mcq" | "free_response" | "explain_back"));
-  const base = db.selectDistinct({ id: questions.id }).from(questions)
+  const candidateLimit = Math.max(limit * 5, 100);
+  const rows = await db.selectDistinct({ id: questions.id }).from(questions)
     .leftJoin(questionTopics, eq(questionTopics.questionId, questions.id))
     .leftJoin(questionTags, eq(questionTags.questionId, questions.id))
     .where(and(...[
@@ -484,15 +495,56 @@ export async function searchQuestions(query: string | null, filters: { topicId?:
       ...(topicId ? [eq(questionTopics.topicId, topicId)] : []),
       ...(filters.tag ? [eq(questionTags.tag, normalizeTag(filters.tag))] : [])
     ]))
-    .limit(limit);
-  const rows = await base;
+    .limit(candidateLimit);
   const questionsOut = await Promise.all(rows.map((row) => serializeQuestion(row.id)));
-  return {
-    questions: questionsOut.map((question) => ({
+  const states = rows.length
+    ? await db.select().from(userQuestionState).where(and(eq(userQuestionState.userId, user.id), inArray(userQuestionState.questionId, rows.map((row) => row.id))))
+    : [];
+  const stateByQuestion = new Map(states.map((state) => [state.questionId, state]));
+  const normalizedQueryTokens = uniqueStrings(slugify(query ?? "").split("_").filter(Boolean));
+  const normalizedTag = filters.tag ? normalizeTag(filters.tag) : null;
+  const now = Date.now();
+  const ranked = questionsOut.map((question) => {
+    const state = stateByQuestion.get(question.id);
+    const due = Boolean(state?.dueAt && state.dueAt.getTime() <= now);
+    const promptTokens = new Set(slugify(question.prompt).split("_").filter(Boolean));
+    const textMatchStrength = normalizedQueryTokens.length
+      ? normalizedQueryTokens.filter((token) => promptTokens.has(token)).length / normalizedQueryTokens.length
+      : 0;
+    const tagOverlap = normalizedTag ? question.question_tags.filter((tag) => tag === normalizedTag).length : 0;
+    const difficultyDistance = filters.difficultyTarget == null ? null : Math.abs(question.difficulty - filters.difficultyTarget);
+    const dueBonusApplied = includeDue && due;
+    const topicMatch = topicId ? question.topic_ids.includes(topicId) : false;
+    const retrievalScore = clamp(
+      (topicId ? (topicMatch ? 0.35 : 0) : 0.15) +
+        (normalizedQueryTokens.length ? textMatchStrength * 0.25 : 0.05) +
+        (normalizedTag ? Math.min(tagOverlap, 1) * 0.15 : 0.05) +
+        question.quality_score * 0.15 +
+        (difficultyDistance == null ? 0.05 : Math.max(0, 1 - difficultyDistance) * 0.1) +
+        (dueBonusApplied ? 0.1 : 0),
+      0,
+      1
+    );
+    const matchType = normalizedQueryTokens.length && textMatchStrength > 0 ? "keyword" : topicId || normalizedTag ? "filter" : "browse";
+    return {
       ...question,
-      match_type: query ? "keyword" : "filter",
-      score: query ? 0.75 : 0.5
-    }))
+      due,
+      due_at: state?.dueAt ?? null,
+      last_rating: state?.lastRating ?? null,
+      match_type: matchType,
+      score: retrievalScore,
+      retrieval_score: retrievalScore,
+      retrieval_signals: {
+        topic_match: topicId ? topicMatch : null,
+        tag_overlap: tagOverlap,
+        difficulty_distance: difficultyDistance,
+        quality_score: question.quality_score,
+        due_bonus_applied: dueBonusApplied
+      }
+    };
+  }).sort((a, b) => b.retrieval_score - a.retrieval_score).slice(0, limit);
+  return {
+    questions: ranked
   };
 }
 

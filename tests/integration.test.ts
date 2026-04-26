@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { beforeAll, describe, expect, it } from "vitest";
 import { sqlClient } from "@/src/db/client";
 import "@/src/db/schema";
@@ -10,8 +11,11 @@ import {
   getQuizResults,
   getReviewDraft,
   getTopicProfile,
+  learnerSnapshot,
   patchReviewDraft,
   saveResponseDraft,
+  searchQuestions,
+  searchTopics,
   submitQuizResponses
 } from "@/src/server/services";
 
@@ -142,6 +146,105 @@ describe("User-AI-Server integration workflows", () => {
     expect(second.topic_ids).toHaveLength(2);
     expect(second.question_tags).toEqual(["definition", "diagnostic", "open-cover"]);
     expect(second.prompt).toContain("finite-subcover");
+  });
+
+  it("models the AI preparing a quiz from topic search, learner snapshot, retrieval metadata, generated questions, and quiz snapshots", async () => {
+    // [User -> AI] "Quiz me on topology."
+    // [AI -> Server] Search/create the topic scope.
+    await createTopic({ slug: "quiz_prep_topology", title: "Quiz Prep Topology", tags: ["topology"] });
+    await createTopic({ slug: "quiz_prep_open_sets", title: "Quiz Prep Open Sets", tags: ["topology"] });
+    const topicMatches = await searchTopics("Quiz Prep Topology", 10);
+    expect(topicMatches.matches.some((match) => match.topic_id === "quiz_prep_topology")).toBe(true);
+
+    // [AI -> Server] Get raw learner state for the topic neighborhood.
+    const snapshotBefore = await learnerSnapshot({
+      topic_ids: ["quiz_prep_topology"],
+      include_related: true,
+      include_prereqs: true,
+      limit_per_bucket: 10
+    });
+    expect(snapshotBefore.topics[0]?.knowledge_score).toBe(0);
+
+    // [AI -> Server] Create one existing reusable question in the pool.
+    const existingQuestion = await createQuestion({
+      slug: "quiz_prep_existing_open_sets",
+      topic_ids: ["quiz_prep_topology", "quiz_prep_open_sets"],
+      question_tags: ["definition", "diagnostic"],
+      modality: "free_response",
+      prompt: "Define an open set in a topology.",
+      difficulty: 0.55,
+      quality_score: 0.8
+    });
+
+    // [AI -> Server] Retrieve existing questions with query-time retrieval metadata.
+    const retrieved = await searchQuestions("open set topology", {
+      topicId: "quiz_prep_topology",
+      tag: "definition",
+      difficultyTarget: 0.6,
+      includeDue: true,
+      limit: 10
+    });
+    const retrievedQuestion = retrieved.questions.find((question) => question.id === existingQuestion.id);
+    expect(retrievedQuestion).toBeDefined();
+    if (!retrievedQuestion) throw new Error("retrieved question missing");
+    expect(retrievedQuestion.retrieval_score).toBeGreaterThan(0);
+    expect(retrievedQuestion.retrieval_signals.topic_match).toBe(true);
+    expect(retrievedQuestion.retrieval_signals.tag_overlap).toBe(1);
+    expect(retrievedQuestion.retrieval_signals.difficulty_distance).toBeCloseTo(0.05);
+    expect(retrievedQuestion.retrieval_signals.quality_score).toBe(0.8);
+    expect(retrievedQuestion.due).toBe(false);
+
+    // [AI -> Server] Retrieval does not update the learner model.
+    const snapshotAfterRetrieval = await learnerSnapshot({
+      topic_ids: ["quiz_prep_topology"],
+      include_related: true,
+      include_prereqs: true,
+      limit_per_bucket: 10
+    });
+    expect(snapshotAfterRetrieval.topics[0]?.knowledge_score).toBe(0);
+    expect(snapshotAfterRetrieval.topics[0]?.coverage_score).toBe(0);
+
+    // [AI -> Server] Create a missing generated question as a normal active tagged question.
+    const generatedQuestion = await createQuestion({
+      slug: "quiz_prep_generated_open_sets_vs_basis",
+      topic_ids: ["quiz_prep_topology", "quiz_prep_open_sets"],
+      question_tags: ["generated", "conceptual", "diagnostic"],
+      modality: "free_response",
+      prompt: "Explain how open sets differ from a basis for a topology.",
+      difficulty: 0.7,
+      quality_score: 0.6,
+      created_by: "ai",
+      provenance: { generated_for: "quiz_prep_topology" }
+    });
+    expect(generatedQuestion.status).toBe("active");
+    expect(generatedQuestion.topic_ids).toHaveLength(2);
+    expect(generatedQuestion.question_tags).toEqual(expect.arrayContaining(["generated", "conceptual", "diagnostic"]));
+
+    // [AI -> Server] Create the quiz from selected question refs.
+    const quiz = await createQuiz({
+      topic_ids: ["quiz_prep_topology"],
+      purpose: "diagnosis",
+      mode: "mixed",
+      difficulty_target: 0.65,
+      answer_reveal_policy: "after_quiz",
+      question_refs: [
+        { question_id: existingQuestion.id, order: 1 },
+        { question_id: generatedQuestion.id, order: 2 }
+      ]
+    });
+
+    // [Server -> AI] Return ordered quiz items with snapshots.
+    expect(quiz.items).toHaveLength(2);
+    expect(quiz.items?.[0]?.question_id).toBe(existingQuestion.id);
+    expect(quiz.items?.[0]?.question_tags).toContain("definition");
+    expect(quiz.items?.[1]?.question_id).toBe(generatedQuestion.id);
+    expect(quiz.items?.[1]?.question_tags).toContain("generated");
+    expect(quiz.items?.[1]?.topic_ids).toHaveLength(2);
+  });
+
+  it("does not expose a parallel questions candidates endpoint", () => {
+    // [AI -> Server] Quiz-planning retrieval should use GET /api/questions, not POST /api/questions/candidates.
+    expect(existsSync("app/api/questions/candidates/route.ts")).toBe(false);
   });
 
   it("models learner review of AI feedback and blocks finalization when re-review is needed", async () => {

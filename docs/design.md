@@ -575,10 +575,13 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
    {
      "q": "open-cover compactness definition",
      "topic_id": "compactness",
+     "tag": "definition",
+     "difficulty_target": 0.6,
+     "include_due": true,
      "limit": 30
    }
    ```
-7. `[Server -> AI]` Return ranked existing questions with modality, difficulty, due-ness, quality, and retrieval signals.
+7. `[Server -> AI]` Return ranked existing questions with modality, difficulty, due-ness, quality, and query-time retrieval signals. These signals explain retrieval only; they are not learner-model evidence.
    ```json
    {
      "questions": [
@@ -589,9 +592,18 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
          "modality": "free_response",
          "difficulty": 0.58,
          "due": true,
+         "due_at": "2026-04-28T18:00:00Z",
          "quality_score": 0.91,
          "match_type": "vector",
-         "score": 0.87
+         "score": 0.87,
+         "retrieval_score": 0.87,
+         "retrieval_signals": {
+           "topic_match": true,
+           "tag_overlap": 1,
+           "difficulty_distance": 0.02,
+           "quality_score": 0.91,
+           "due_bonus_applied": true
+         }
        }
      ]
    }
