@@ -143,8 +143,8 @@ These are app routes, not server API routes, but they show how the web UI maps o
 
 | UI route | Purpose | Backing API |
 | --- | --- | --- |
-| `/quizzes/:quizId/review` | Review and finalize staged AI feedback | `GET /api/quizzes/:quizId/review-draft`, `PATCH /api/quizzes/:quizId/review-draft`, `POST /api/quizzes/:quizId/review-draft/finalize` |
-| `/quizzes/:quizId/results` | See quiz results | `GET /api/quizzes/:quizId/results` |
+| `/quizzes/:quizId/results` | Review draft results or finalized quiz results | `GET /api/quizzes/:quizId/review-draft`, `GET /api/quizzes/:quizId/results` |
+| `/quizzes/:quizId/results` | Edit and finalize staged review | `PATCH /api/quizzes/:quizId/review-draft`, `POST /api/quizzes/:quizId/review-draft/finalize` |
 | `/quizzes/:quizId/results` | Submit quiz feedback | `POST /api/quizzes/:quizId/feedback` |
 | `/topics/:topicId` | Inspect a topic profile | `GET /api/topics/:topicId/profile`, `GET /api/topics/:topicId/edges` |
 | `/progress` | Inspect overall learning progress | `GET /api/progress/overview` |
@@ -191,24 +191,26 @@ Main server outputs:
 - stored review-draft metadata and AI-authored summary fields
 - quiz status updated to `review_drafted`
 
-### 3.4 Review and Finalize Quiz Draft
-Used by Next.js review UI:
+### 3.4 See Quiz Results / Review Draft
+Used by AI and Next.js:
 - `GET /api/quizzes/:quizId/review-draft`
 - `PATCH /api/quizzes/:quizId/review-draft`
-- `POST /api/quizzes/:quizId/review-draft/finalize`
-
-Main server outputs:
-- editable review form payload
-- saved review draft metadata
-- immutable grade IDs and deterministic learner-model update metadata
-- results-ready status for the quiz
-
-### 3.5 See Quiz Results
-Used by AI and Next.js:
 - `GET /api/quizzes/:quizId/results`
 
 Main server outputs:
-- aggregated quiz results with overview, ratings, item feedback, and topic deltas
+- editable review form payload when the quiz is in draft review state
+- saved review draft metadata
+- finalized result payload when the quiz has been finalized
+
+### 3.5 Finalize Quiz Review
+Used by Next.js results UI:
+- `POST /api/quizzes/:quizId/review-draft/finalize`
+- `GET /api/quizzes/:quizId/results`
+
+Main server outputs:
+- immutable grade IDs and deterministic learner-model update metadata
+- results-ready status for the quiz
+- finalized quiz results with overview, ratings, item feedback, and topic deltas
 
 ### 3.6 Explain Back
 Same core endpoints as quizzes and answers:
@@ -636,8 +638,14 @@ Optional assessment context fields:
 - `difficulty_target`
 - `hint_policy`
 - `time_pressure`
+- `answer_reveal_policy`
 
 These fields are stored as metadata. They help later review and interpretation, but the server should not infer quiz behavior from them.
+
+`answer_reveal_policy` controls chat disclosure behavior:
+- `after_each_item`: the AI may reveal correctness or feedback after each item
+- `after_quiz`: the AI should wait until the quiz is submitted or reviewed
+- `never_in_chat`: the AI should keep answers and feedback out of chat and rely on the review/results UI
 
 Example request:
 ```json
@@ -649,6 +657,7 @@ Example request:
   "grading_posture": "strict",
   "difficulty_target": 0.65,
   "hint_policy": "no_hints",
+  "answer_reveal_policy": "after_quiz",
   "time_pressure": null,
   "question_refs": [
     { "question_id": "q_compact_2", "order": 1 },
@@ -665,6 +674,7 @@ Example response:
   "grading_posture": "strict",
   "difficulty_target": 0.65,
   "hint_policy": "no_hints",
+  "answer_reveal_policy": "after_quiz",
   "time_pressure": null,
   "item_count": 4,
   "items": [
@@ -699,6 +709,7 @@ Example response:
   "grading_posture": "strict",
   "difficulty_target": 0.65,
   "hint_policy": "no_hints",
+  "answer_reveal_policy": "after_quiz",
   "time_pressure": null,
   "status": "in_progress",
   "item_count": 4,
@@ -747,6 +758,8 @@ Return prior quizzes for a topic or scope.
 Return full review results for a quiz after the review draft is finalized.
 
 If the quiz status is still `created`, `in_progress`, `responses_submitted`, or `review_drafted`, return a not-ready response instead of partial results.
+
+The Next.js results page should call this endpoint only for finalized results. If the quiz is still in `review_drafted`, the same page should call `GET /api/quizzes/:quizId/review-draft` instead.
 
 Top-level summary fields such as `overview`, `strengths`, `weaknesses`, and `improvement_targets` come from the finalized review draft. Deterministic counts, topic deltas, outcomes, and grade metadata come from stored finalized records.
 
@@ -843,6 +856,8 @@ This is the preferred path during live chat quizzes. The AI can still keep conve
 
 This endpoint does not grade, submit, or update the learner model. Draft responses remain editable until the quiz responses are submitted.
 
+The request may also include `answer_reveal_policy` if the learner changes their chat preference mid-quiz. The server stores or echoes the effective policy, but the AI is responsible for honoring it in chat.
+
 Allowed `outcome` values:
 - `answered`
 - `skipped`
@@ -857,7 +872,8 @@ Example request:
   "outcome": "answered",
   "answer_text": "A space is compact if every open cover has a finite subcover.",
   "image_refs": [],
-  "submitted_from": "chat"
+  "submitted_from": "chat",
+  "answer_reveal_policy": "after_quiz"
 }
 ```
 
@@ -869,6 +885,7 @@ Example response:
   "quiz_item_id": "qi_002",
   "outcome": "answered",
   "response_state": "draft",
+  "answer_reveal_policy": "after_quiz",
   "quiz_status": "in_progress"
 }
 ```
@@ -1074,7 +1091,7 @@ Example response:
 ### `GET /api/quizzes/:quizId/review-draft`
 Return the editable review draft form for a quiz.
 
-This powers the Next.js review page where the learner can inspect questions, responses, AI feedback, proposed ratings, misconceptions, and topic evidence before finalization.
+This powers the draft state of the Next.js quiz results page where the learner can inspect questions, responses, AI feedback, proposed ratings, misconceptions, and topic evidence before finalization.
 
 Example response:
 ```json

@@ -65,7 +65,8 @@ Recommended UI routes and backing API endpoints:
 
 | UI route | Purpose | Backing API |
 | --- | --- | --- |
-| `/quizzes/:quizId/results` | See quiz results | `GET /api/quizzes/:quizId/results` |
+| `/quizzes/:quizId/results` | Review draft results or finalized quiz results | `GET /api/quizzes/:quizId/review-draft`, `GET /api/quizzes/:quizId/results` |
+| `/quizzes/:quizId/results` | Edit and finalize staged review | `PATCH /api/quizzes/:quizId/review-draft`, `POST /api/quizzes/:quizId/review-draft/finalize` |
 | `/quizzes/:quizId/results` | Submit quiz feedback | `POST /api/quizzes/:quizId/feedback` |
 | `/topics/:topicId` | Inspect a topic profile | `GET /api/topics/:topicId/profile`, `GET /api/topics/:topicId/edges` |
 | `/progress` | Inspect overall learning progress | `GET /api/progress/overview` |
@@ -327,6 +328,12 @@ A quiz may optionally store assessment context. These fields are metadata for la
 - `difficulty_target`
 - `hint_policy`
 - `time_pressure`
+- `answer_reveal_policy`
+
+`answer_reveal_policy` controls when the AI should reveal correctness, answer keys, rubrics, or feedback in chat:
+- `after_each_item`: the AI may reveal feedback after each item
+- `after_quiz`: the AI should wait until the quiz is submitted or reviewed
+- `never_in_chat`: the AI should keep answers and feedback out of chat and rely on the review/results UI
 
 Quiz status should stay simple in V1:
 - `created`: quiz items exist, but no responses have been saved
@@ -585,6 +592,7 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
      "grading_posture": "strict",
      "difficulty_target": 0.65,
      "hint_policy": "no_hints",
+     "answer_reveal_policy": "after_quiz",
      "time_pressure": null,
      "question_refs": [
        { "question_id": "q_compact_2", "order": 1 },
@@ -612,6 +620,8 @@ The quiz may be for mastery, interview simulation, gap diagnosis, or gathering e
 ### 4.2 Answer Quiz Item
 During a live quiz, learner answers should be saved as durable drafts. The AI can still keep conversational context, but the server should have the raw answer so reloads, browser failures, or AI restarts do not lose assessment evidence.
 
+The learner can also ask the AI not to reveal answers or feedback in chat until the end of the quiz. This is controlled by `answer_reveal_policy`. The response-draft endpoint can update or echo the effective policy, but it still does not grade or reveal correctness.
+
 If the learner abandons the quiz, draft responses may remain saved, but they are not submitted, graded, or used for the learner model.
 
 1. `[Learner -> AI]` Answer, skip, time out, or abandon the current quiz item.
@@ -622,7 +632,8 @@ If the learner abandons the quiz, draft responses may remain saved, but they are
      "outcome": "answered",
      "answer_text": "A space is compact if every open cover has a finite subcover.",
      "image_refs": [],
-     "submitted_from": "chat"
+     "submitted_from": "chat",
+     "answer_reveal_policy": "after_quiz"
    }
    ```
 3. `[Server -> AI]` Return the durable draft response metadata.
@@ -633,10 +644,11 @@ If the learner abandons the quiz, draft responses may remain saved, but they are
      "quiz_item_id": "qi_002",
      "outcome": "answered",
      "response_state": "draft",
+     "answer_reveal_policy": "after_quiz",
      "quiz_status": "in_progress"
    }
    ```
-4. `[AI -> Learner]` Present the next quiz item from the AI's local quiz item list.
+4. `[AI -> Learner]` Present the next quiz item from the AI's local quiz item list. If `answer_reveal_policy` is `after_quiz` or `never_in_chat`, do not reveal correctness, answer keys, rubrics, or grading feedback in chat.
 5. `[Learner -> AI]` Optionally revise an answer before responses are submitted.
 6. `[AI -> Server]` Save the revision through the same response-draft endpoint. `POST /api/quiz-items/:quizItemId/response-draft`
    Skip or no-answer outcomes use the same endpoint:
@@ -737,12 +749,14 @@ Responses are submitted when the quiz ends naturally or when the learner asks to
    }
    ```
 
-### 4.4 Review and Finalize Quiz Draft
-The review draft is the staging area that preserves immutability. The learner can edit display feedback, add dispute notes, or exclude invalid items before grades exist. The learner should not directly edit ratings, evidence scores, or topic evidence. If those need to change, the item should be marked for AI re-review before finalization. Once finalized, grades can never be updated.
+### 4.4 See Quiz Results / Review Draft
+The quiz results page is the main post-quiz inspection surface. It has two states:
+- draft review state: the quiz has staged AI feedback, but grades are not immutable yet
+- finalized results state: the quiz has immutable grades and learner-model updates
 
-Finalization should reject a review draft if any non-excluded item still has `needs_ai_re_review: true`.
+In the draft review state, the learner can inspect questions, responses, item outcomes, AI feedback, proposed ratings, and topic evidence before finalization. The learner can edit display feedback, add dispute notes, or exclude invalid items. The learner should not directly edit ratings, evidence scores, or topic evidence. If those need to change, the item should be marked for AI re-review before finalization.
 
-1. `[Next.js UI -> Server]` Fetch the review draft form. `GET /api/quizzes/:quizId/review-draft`
+1. `[Next.js UI -> Server]` Open the quiz results page in draft state. `GET /api/quizzes/:quizId/review-draft`
 2. `[Server -> Next.js UI]` Return questions, responses, item outcomes, AI feedback, proposed ratings, topic evidence, and stored summary fields.
    ```json
    {
@@ -794,44 +808,8 @@ Finalization should reject a review draft if any non-excluded item still has `ne
    }
    ```
 5. `[Server -> Next.js UI]` Save the safe learner edits. If a dispute reason is provided, mark the item `needs_ai_re_review`.
-6. `[Learner -> Next.js UI]` Submit the final review.
-7. `[Next.js UI -> Server]` Finalize the review draft. `POST /api/quizzes/:quizId/review-draft/finalize`
-   Body:
-   ```json
-   {
-     "idempotency_key": "quiz_001_finalize_review_001"
-   }
-   ```
-8. `[Server -> Next.js UI]` Create immutable grades, compute deterministic learner-model updates from finalized evidence, and mark the quiz `finalized`.
-   ```json
-   {
-     "quiz_id": "quiz_001",
-     "status": "finalized",
-     "grades": [
-       {
-         "response_id": "resp_002",
-         "grade_id": "grade_002",
-         "outcome": "answered",
-         "excluded": false
-       }
-     ],
-     "learner_model_updates": [
-       {
-         "topic_id": "compactness",
-         "applied": true
-       }
-     ],
-     "results_ready": true
-   }
-   ```
-
-### 4.5 See Quiz Results
-1. `[AI -> Server]` Fetch the aggregated review payload. `GET /api/quizzes/:quizId/results`
-   Query:
-   ```json
-   { "quiz_id": "quiz_001" }
-   ```
-2. `[Server -> AI]` If the quiz has not reached `finalized`, return a not-ready status. Otherwise return full quiz results with overview, strengths, weaknesses, improvement targets, rating counts, per-item feedback, and topic deltas.
+6. `[AI -> Server]` If the learner asks in chat for finalized results, fetch the finalized result payload. `GET /api/quizzes/:quizId/results`
+7. `[Server -> AI]` If the quiz has not reached `finalized`, return a not-ready status. Otherwise return full quiz results with overview, strengths, weaknesses, improvement targets, rating counts, per-item feedback, and topic deltas.
    ```json
    {
      "quiz_id": "quiz_001",
@@ -857,9 +835,45 @@ Finalization should reject a review draft if any non-excluded item still has `ne
      ]
    }
    ```
-3. `[AI -> Learner]` Summarize the results in chat.
-4. `[Next.js UI -> Server]` Request the same quiz results for the results page. `GET /api/quizzes/:quizId/results`
-5. `[Server -> Next.js UI]` Return the same review payload for rendering.
+8. `[AI -> Learner]` Summarize finalized results in chat, or explain that the quiz is still in draft review state.
+
+### 4.5 Finalize Quiz Review
+Finalization is an action from the results page. It turns staged review evidence into immutable grades and learner-model updates. Once finalized, grades can never be updated.
+
+Finalization should reject a review draft if any non-excluded item still has `needs_ai_re_review: true`.
+
+1. `[Learner -> Next.js UI]` Submit the final review from the results page.
+2. `[Next.js UI -> Server]` Finalize the review draft. `POST /api/quizzes/:quizId/review-draft/finalize`
+   Body:
+   ```json
+   {
+     "idempotency_key": "quiz_001_finalize_review_001"
+   }
+   ```
+3. `[Server -> Next.js UI]` Create immutable grades, compute deterministic learner-model updates from finalized evidence, and mark the quiz `finalized`.
+   ```json
+   {
+     "quiz_id": "quiz_001",
+     "status": "finalized",
+     "grades": [
+       {
+         "response_id": "resp_002",
+         "grade_id": "grade_002",
+         "outcome": "answered",
+         "excluded": false
+       }
+     ],
+     "learner_model_updates": [
+       {
+         "topic_id": "compactness",
+         "applied": true
+       }
+     ],
+     "results_ready": true
+   }
+   ```
+4. `[Next.js UI -> Server]` Fetch finalized results for rendering. `GET /api/quizzes/:quizId/results`
+5. `[Server -> Next.js UI]` Return finalized result payload.
 
 ### 4.6 Explain Back
 1. `[Learner -> AI]` Ask to explain a topic in their own words.
@@ -913,7 +927,7 @@ Finalization should reject a review draft if any non-excluded item still has `ne
 9. `[Server -> AI]` Return the response ID and review payload for the explain-back item.
 10. `[AI -> AI]` Create review-draft feedback for correctness, depth, coverage, articulation, and misconceptions.
 11. `[AI -> Server]` Store the mutable review draft. `POST /api/quizzes/:quizId/review-draft`
-12. `[Next.js UI -> Server]` Let the learner inspect/edit/finalize the review draft. `GET /api/quizzes/:quizId/review-draft`, `PATCH /api/quizzes/:quizId/review-draft`, `POST /api/quizzes/:quizId/review-draft/finalize`
+12. `[Next.js UI -> Server]` Open the quiz results page in draft state so the learner can inspect, edit, and finalize the review. `GET /api/quizzes/:quizId/review-draft`, `PATCH /api/quizzes/:quizId/review-draft`, `POST /api/quizzes/:quizId/review-draft/finalize`
 13. `[AI -> Learner]` Return explain-back feedback and any follow-up prompt after finalization.
 
 ### 4.7 Find Gaps
