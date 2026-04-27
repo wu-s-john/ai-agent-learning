@@ -1319,8 +1319,35 @@ export async function reviewItems(filters: { topicId?: string | null; limit?: nu
 
 export async function activity(filters: { topicId?: string | null; limit?: number }) {
   const limit = filters.limit ?? 50;
-  const rows = await db.select().from(activityEvents).orderBy(desc(activityEvents.createdAt)).limit(limit);
-  return { items: rows.map((row) => ({ event_id: row.id, event_type: row.eventType, entity_type: row.entityType, entity_id: row.entityId, created_at: row.createdAt, ...(row.payloadJson as Record<string, unknown>) })) };
+  const topicId = filters.topicId ? await resolveTopicId(filters.topicId) : null;
+  const readLimit = topicId ? Math.max(limit * 20, 200) : limit;
+  const rows = await db.select().from(activityEvents).orderBy(desc(activityEvents.createdAt)).limit(readLimit);
+  const scopedRows = [];
+  for (const row of rows) {
+    if (!topicId || await activityEventMatchesTopic(row, topicId)) scopedRows.push(row);
+    if (scopedRows.length >= limit) break;
+  }
+  return { items: scopedRows.map((row) => ({ event_id: row.id, event_type: row.eventType, entity_type: row.entityType, entity_id: row.entityId, created_at: row.createdAt, ...(row.payloadJson as Record<string, unknown>) })) };
+}
+
+async function activityEventMatchesTopic(row: typeof activityEvents.$inferSelect, topicId: string) {
+  if (!row.entityId) return false;
+  if (row.entityType === "topic") return row.entityId === topicId;
+  if (row.entityType === "quiz") {
+    const quiz = await db.query.quizzes.findFirst({ where: eq(quizzes.id, row.entityId) });
+    return quiz ? asArray<string>(quiz.topicIdsSnapshot).includes(topicId) : false;
+  }
+  if (row.entityType === "response") {
+    const response = await db.query.responses.findFirst({ where: eq(responses.id, row.entityId) });
+    if (!response) return false;
+    const item = await db.query.quizItems.findFirst({ where: eq(quizItems.id, response.quizItemId) });
+    return item ? asArray<string>(item.topicIdsSnapshot).includes(topicId) : false;
+  }
+  if (row.entityType === "question") {
+    const linked = await db.query.questionTopics.findFirst({ where: and(eq(questionTopics.questionId, row.entityId), eq(questionTopics.topicId, topicId)) });
+    return Boolean(linked);
+  }
+  return false;
 }
 
 export async function learnerModelUpdateList(filters: { status?: string | null; limit?: number }) {

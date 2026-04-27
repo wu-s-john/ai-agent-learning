@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { sqlClient } from "@/src/db/client";
 import "@/src/db/schema";
 import {
+  activity,
   createQuestion,
   createQuiz,
   createReviewDraft,
@@ -900,6 +901,25 @@ describe("User-AI-Server integration workflows", () => {
     const profile = await getTopicProfile("timed_out_counts_topic");
     expect(profile.knowledge_score).toBeGreaterThan(0);
     expect(profile.weaknesses).toContain("Could not produce answer under time pressure");
+  });
+
+  it("filters activity by topic scope for knowledge-model inspection", async () => {
+    // [AI -> Server] Create activity for two unrelated topic scopes.
+    const target = await createSubmittedSingleItemQuiz({
+      topicSlug: "activity_filter_target",
+      questionSlug: "activity_filter_target_question",
+      submitKey: "activity-filter-target-submit"
+    });
+    const other = await createSubmittedSingleItemQuiz({
+      topicSlug: "activity_filter_other",
+      questionSlug: "activity_filter_other_question",
+      submitKey: "activity-filter-other-submit"
+    });
+
+    // [Knowledge Modeler -> Server] Activity reads should honor topic_id.
+    const targetActivity = await activity({ topicId: "activity_filter_target", limit: 50 });
+    expect(targetActivity.items.some((item) => item.entity_id === target.quiz.quiz_id)).toBe(true);
+    expect(targetActivity.items.some((item) => item.entity_id === other.quiz.quiz_id)).toBe(false);
   });
 
   it("models learner review of AI feedback and blocks finalization when re-review is needed", async () => {

@@ -154,6 +154,11 @@ When changing learning semantics:
 - keep skipped, no-answer, timed-out, and abandoned outcomes distinct from never-presented quiz items
 - save `no_answer` as soon as a quiz item is shown, then update that draft if the learner answers
 - respect `answer_reveal_policy`, especially `after_quiz` and `never_in_chat`
+- include `outcome` on every review draft item, matching the stored quiz item outcome exactly
+- ensure non-excluded review draft items include `review_rating` and at least one `topic_evidence` row
+- use `excluded: true` for invalid items that should not affect learner-model projections
+- when replacing a review draft, include every item that should remain staged for finalization
+- never finalize an empty review draft or a draft with non-excluded items marked `needs_ai_re_review`
 
 When adding tests:
 - write integration tests only; do not add isolated unit tests for helpers or schemas
@@ -187,8 +192,11 @@ it("models a full quiz where the AI uses fixture review JSON and the server upda
   // [AI -> AI] Fixture JSON stands in for LLM grading/review.
   // [AI -> Server] Store review draft.
   await createReviewDraft(quiz.quiz_id, {
+    idempotency_key: "draft-compactness",
     items: [{
       response_id: answeredDraft.response_id,
+      outcome: "answered",
+      overall_feedback: "Correct. You included the key finite-subcover condition.",
       review_rating: "Good",
       evidence_score: 0.82,
       topic_evidence: [{ topic_id: "compactness", evidence_strength: 0.82, coverage_signal: 0.4 }]
