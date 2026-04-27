@@ -1,0 +1,5 @@
+settings.local.json
+scheduled_tasks.lock
+*.log
+logs/
+.cache/
