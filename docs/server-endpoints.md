@@ -1079,6 +1079,14 @@ Evidence may target any existing topic, even if the topic was not originally lin
 
 The AI should not submit canonical `knowledge_delta` or `coverage_delta` values. It should submit review evidence. Final learner-model updates are computed deterministically when the review draft is finalized.
 
+Validation rules:
+- each `response_id` may appear at most once in the draft
+- each response must belong to the quiz being reviewed
+- each response must already be submitted or review-drafted
+- each draft item `outcome` must match the stored quiz item outcome
+- non-excluded items require `review_rating` and at least one `topic_evidence` row
+- excluded items may omit `review_rating`, `evidence_score`, and `topic_evidence`
+
 Retries should use the same `idempotency_key`; the server should return the same result for the same body and reject conflicting retries.
 
 Example request:
@@ -1208,7 +1216,11 @@ Finalize the staged review draft.
 
 This is the only endpoint that turns staged review evidence into immutable grade results and learner-model updates. It should atomically:
 - validate that all referenced responses are submitted
+- validate that all referenced responses still belong to the quiz
+- validate that stored quiz item outcomes still match the staged review outcomes
+- reject empty review drafts
 - reject finalization if any non-excluded item has `needs_ai_re_review: true`
+- reject non-excluded items without `review_rating` or topic evidence
 - create immutable `grade_results`
 - create topic evidence rows from the final review draft
 - compute learner-model updates using deterministic projection rules

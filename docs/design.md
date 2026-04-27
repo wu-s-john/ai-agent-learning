@@ -488,6 +488,14 @@ Once a review draft is finalized, do not mutate responses, grades, or learner-mo
 
 There should not be a separate queue abstraction in V1. Pending/applied learner-model updates can be exposed through a read-only status endpoint for debugging, but normal processing happens when the review draft is finalized.
 
+Review drafts are staging records, so the server should validate them before they become canonical evidence:
+- a draft item must reference a submitted response from the same quiz
+- a response may appear at most once in a review draft
+- the draft item outcome must match the stored quiz item outcome
+- non-excluded draft items require `review_rating` and at least one `topic_evidence` row
+- excluded draft items may omit rating and evidence and do not affect learner-model updates
+- finalization rejects empty review drafts and any non-excluded item that still needs AI re-review
+
 #### V1 Projection Rule
 The AI can propose ratings, feedback, misconceptions, `evidence_score`, and topic evidence in the review draft, but it should not submit canonical `knowledge_delta` or `coverage_delta` values.
 

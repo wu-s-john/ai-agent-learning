@@ -11,10 +11,13 @@ import {
   getQuizItems,
   getQuizResults,
   getReviewDraft,
+  getResponse,
   getResponseGrades,
   getTopicProfile,
   learnerSnapshot,
+  learnerModelUpdateList,
   patchReviewDraft,
+  reviewItems,
   saveResponseDraft,
   searchQuestions,
   searchTopics,
@@ -23,6 +26,38 @@ import {
 
 async function resetIntegrationDatabase() {
   await sqlClient`TRUNCATE TABLE idempotency_keys, learner_model_updates, grade_topic_evidence, grade_results, review_draft_topic_evidence, review_draft_items, review_drafts, responses, quiz_items, quizzes, question_embeddings, question_tags, question_topics, questions, topic_embeddings, topic_edges, topic_tags, topic_aliases, topic_profiles, user_question_state, user_topic_review_state, activity_events, quiz_feedback, topic_proposals, users, reference_sources, reference_chunks, reference_embeddings RESTART IDENTITY CASCADE`;
+}
+
+async function createSubmittedSingleItemQuiz(input: {
+  topicSlug: string;
+  questionSlug: string;
+  prompt?: string;
+  outcome?: "answered" | "skipped" | "no_answer" | "timed_out" | "abandoned" | "excluded";
+  answerText?: string | null;
+  submitKey: string;
+}) {
+  await createTopic({ slug: input.topicSlug, title: input.topicSlug.replaceAll("_", " "), tags: ["topology"] });
+  const question = await createQuestion({
+    slug: input.questionSlug,
+    topic_ids: [input.topicSlug],
+    question_tags: ["definition"],
+    modality: "free_response",
+    prompt: input.prompt ?? "Define the target concept."
+  });
+  const quiz = await createQuiz({
+    topic_ids: [input.topicSlug],
+    question_refs: [{ question_id: question.id, order: 1 }]
+  });
+  const items = await getQuizItems(quiz.quiz_id);
+  const response = await saveResponseDraft(items.items[0]!.quiz_item_id, {
+    outcome: input.outcome ?? "answered",
+    answer_text: input.answerText ?? "A correct enough answer."
+  });
+  const submitted = await submitQuizResponses(quiz.quiz_id, {
+    idempotency_key: input.submitKey,
+    submitted_from: "test"
+  });
+  return { quiz, question, response, submitted };
 }
 
 describe("User-AI-Server integration workflows", () => {
@@ -518,6 +553,353 @@ describe("User-AI-Server integration workflows", () => {
     const profile = await getTopicProfile("answer_pipeline_review_edits");
     expect(profile.knowledge_score).toBe(0);
     expect(profile.coverage_score).toBe(0);
+  });
+
+  it("finalizes a valid review draft into immutable grades, deterministic profile updates, due state, and finalized results", async () => {
+    // [User -> AI -> Server] Submit a quiz response and stage valid AI review evidence.
+    const { quiz, response } = await createSubmittedSingleItemQuiz({
+      topicSlug: "finalize_projection_topic",
+      questionSlug: "finalize_projection_question",
+      prompt: "State the definition used for this projection test.",
+      answerText: "Every open cover has a finite subcover.",
+      submitKey: "finalize-projection-submit"
+    });
+    await createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "finalize-projection-draft",
+      summary: {
+        overview: "Projection-ready review.",
+        strengths: ["Precise definition"],
+        weaknesses: ["Needs examples"],
+        improvement_targets: ["examples"]
+      },
+      items: [{
+        response_id: response.response_id,
+        outcome: "answered",
+        overall_feedback: "Correct definition.",
+        review_rating: "Good",
+        evidence_score: 0.5,
+        strengths: ["Precise definition"],
+        weaknesses: ["Needs examples"],
+        misconceptions: ["Overfocuses on memorized definition"],
+        topic_evidence: [{
+          topic_id: "finalize_projection_topic",
+          evidence_strength: 0.5,
+          coverage_signal: 0.25
+        }]
+      }]
+    });
+
+    // [UI -> Server] Finalize the review draft.
+    const finalized = await finalizeReviewDraft(quiz.quiz_id, { idempotency_key: "finalize-projection-finalize" });
+    expect(finalized.status).toBe("finalized");
+    expect(finalized.grade_results).toHaveLength(1);
+    expect(finalized.learner_model_updates).toHaveLength(1);
+
+    // [UI -> Server] Same idempotency key returns the same finalized response.
+    const finalizedAgain = await finalizeReviewDraft(quiz.quiz_id, { idempotency_key: "finalize-projection-finalize" });
+    expect(finalizedAgain).toEqual(finalized);
+
+    // [UI -> Server] Different finalization key after success conflicts.
+    await expect(finalizeReviewDraft(quiz.quiz_id, { idempotency_key: "finalize-projection-finalize-again" })).rejects.toThrow(/already finalized/i);
+
+    // [AI/UI -> Server] Finalized result payload exposes ratings, items, and topic deltas.
+    const results = await getQuizResults(quiz.quiz_id);
+    expect(results.results_ready).toBe(true);
+    if (!("rating_counts" in results)) throw new Error("quiz results were not finalized");
+    expect((results as { overview?: unknown }).overview).toBe("Projection-ready review.");
+    expect(results.rating_counts.Good).toBe(1);
+    expect(results.items[0]?.feedback).toBe("Correct definition.");
+    expect(results.topic_deltas[0]?.before_knowledge).toBe(0);
+    expect(results.topic_deltas[0]?.after_knowledge).toBeCloseTo(0.15);
+    expect(results.topic_deltas[0]?.before_coverage).toBe(0);
+    expect(results.topic_deltas[0]?.after_coverage).toBeCloseTo(0.03);
+
+    // [AI/UI -> Server] Topic profile reflects finalized evidence only.
+    const profile = await getTopicProfile("finalize_projection_topic");
+    expect(profile.knowledge_score).toBeCloseTo(0.15);
+    expect(profile.coverage_score).toBeCloseTo(0.03);
+    expect(profile.strengths).toContain("Precise definition");
+    expect(profile.weaknesses).toContain("Needs examples");
+    expect(profile.active_misconceptions).toContain("Overfocuses on memorized definition");
+    expect(profile.evidence_count).toBe(1);
+    expect(profile.last_reviewed_at).toBeInstanceOf(Date);
+
+    // [AI -> Server] Review state exposes due scheduling after finalization.
+    const dueItems = await reviewItems({ topicId: "finalize_projection_topic", limit: 10 });
+    expect(dueItems.items).toHaveLength(1);
+    expect(dueItems.items[0]?.question_id).toBe("finalize_projection_question");
+    expect(dueItems.items[0]?.last_rating).toBe("Good");
+    expect(dueItems.items[0]?.due_at).toBeInstanceOf(Date);
+
+    const updates = await learnerModelUpdateList({ status: "applied", limit: 20 });
+    expect(updates.updates.some((update) => update.quiz_id === quiz.quiz_id)).toBe(true);
+
+    const grades = await getResponseGrades(response.response_id);
+    expect(grades.grades).toHaveLength(1);
+    expect(grades.grades[0]?.review_rating).toBe("Good");
+
+    // [Server] Finalized records are immutable through public workflow calls.
+    const items = await getQuizItems(quiz.quiz_id);
+    await expect(saveResponseDraft(items.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "Trying to edit finalized response."
+    })).rejects.toThrow(/Cannot edit responses/);
+    const draft = await getReviewDraft(quiz.quiz_id);
+    await expect(patchReviewDraft(quiz.quiz_id, {
+      items: [{
+        review_draft_item_id: draft.items[0]!.review_draft_item_id,
+        overall_feedback: "Trying to patch finalized review."
+      }]
+    })).rejects.toThrow(/finalized/);
+    await expect(createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "finalize-projection-recreate",
+      summary: {},
+      items: [{
+        response_id: response.response_id,
+        outcome: "answered",
+        overall_feedback: "Trying to recreate finalized review.",
+        review_rating: "Good",
+        evidence_score: 0.5,
+        topic_evidence: [{ topic_id: "finalize_projection_topic", evidence_strength: 0.5, coverage_signal: 0.25 }]
+      }]
+    })).rejects.toThrow(/finalized/);
+  });
+
+  it("rejects invalid review draft payloads before they can become canonical evidence", async () => {
+    // [AI -> Server] Prepare two submitted quizzes to test response ownership and payload invariants.
+    const first = await createSubmittedSingleItemQuiz({
+      topicSlug: "invalid_draft_first",
+      questionSlug: "invalid_draft_first_question",
+      submitKey: "invalid-draft-first-submit"
+    });
+    const second = await createSubmittedSingleItemQuiz({
+      topicSlug: "invalid_draft_second",
+      questionSlug: "invalid_draft_second_question",
+      submitKey: "invalid-draft-second-submit"
+    });
+
+    await expect(createReviewDraft(first.quiz.quiz_id, {
+      idempotency_key: "invalid-draft-cross-quiz",
+      summary: {},
+      items: [{
+        response_id: second.response.response_id,
+        outcome: "answered",
+        overall_feedback: "Cross-quiz response should not be accepted.",
+        review_rating: "Good",
+        evidence_score: 0.7,
+        topic_evidence: [{ topic_id: "invalid_draft_first", evidence_strength: 0.7, coverage_signal: 0.2 }]
+      }]
+    })).rejects.toThrow(/does not belong/);
+
+    await expect(createReviewDraft(first.quiz.quiz_id, {
+      idempotency_key: "invalid-draft-duplicate",
+      summary: {},
+      items: [
+        {
+          response_id: first.response.response_id,
+          outcome: "answered",
+          overall_feedback: "First copy.",
+          review_rating: "Good",
+          evidence_score: 0.7,
+          topic_evidence: [{ topic_id: "invalid_draft_first", evidence_strength: 0.7, coverage_signal: 0.2 }]
+        },
+        {
+          response_id: first.response.response_id,
+          outcome: "answered",
+          overall_feedback: "Duplicate copy.",
+          review_rating: "Good",
+          evidence_score: 0.7,
+          topic_evidence: [{ topic_id: "invalid_draft_first", evidence_strength: 0.7, coverage_signal: 0.2 }]
+        }
+      ]
+    })).rejects.toThrow(/duplicate/);
+
+    await expect(createReviewDraft(first.quiz.quiz_id, {
+      idempotency_key: "invalid-draft-outcome",
+      summary: {},
+      items: [{
+        response_id: first.response.response_id,
+        outcome: "skipped",
+        overall_feedback: "Outcome mismatch should not be accepted.",
+        review_rating: "Good",
+        evidence_score: 0.7,
+        topic_evidence: [{ topic_id: "invalid_draft_first", evidence_strength: 0.7, coverage_signal: 0.2 }]
+      }]
+    })).rejects.toThrow(/outcome/);
+
+    await expect(createReviewDraft(first.quiz.quiz_id, {
+      idempotency_key: "invalid-draft-missing-rating",
+      summary: {},
+      items: [{
+        response_id: first.response.response_id,
+        outcome: "answered",
+        overall_feedback: "Missing rating should not be accepted.",
+        evidence_score: 0.7,
+        topic_evidence: [{ topic_id: "invalid_draft_first", evidence_strength: 0.7, coverage_signal: 0.2 }]
+      }]
+    })).rejects.toThrow(/review rating/);
+
+    await expect(createReviewDraft(first.quiz.quiz_id, {
+      idempotency_key: "invalid-draft-missing-evidence",
+      summary: {},
+      items: [{
+        response_id: first.response.response_id,
+        outcome: "answered",
+        overall_feedback: "Missing evidence should not be accepted.",
+        review_rating: "Good",
+        evidence_score: 0.7,
+        topic_evidence: []
+      }]
+    })).rejects.toThrow(/topic evidence/);
+  });
+
+  it("replaces review drafts without leaving omitted responses in review-drafted state", async () => {
+    // [AI -> Server] Create a two-item submitted quiz.
+    await createTopic({ slug: "replace_review_draft_topic", title: "replace review draft topic", tags: ["topology"] });
+    const firstQuestion = await createQuestion({
+      slug: "replace_review_draft_first_question",
+      topic_ids: ["replace_review_draft_topic"],
+      question_tags: ["definition"],
+      modality: "free_response",
+      prompt: "Define the first concept."
+    });
+    const secondQuestion = await createQuestion({
+      slug: "replace_review_draft_second_question",
+      topic_ids: ["replace_review_draft_topic"],
+      question_tags: ["example"],
+      modality: "free_response",
+      prompt: "Give an example of the concept."
+    });
+    const quiz = await createQuiz({
+      topic_ids: ["replace_review_draft_topic"],
+      question_refs: [
+        { question_id: firstQuestion.id, order: 1 },
+        { question_id: secondQuestion.id, order: 2 }
+      ]
+    });
+    const items = await getQuizItems(quiz.quiz_id);
+    const firstResponse = await saveResponseDraft(items.items[0]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "First answer."
+    });
+    const secondResponse = await saveResponseDraft(items.items[1]!.quiz_item_id, {
+      outcome: "answered",
+      answer_text: "Second answer."
+    });
+    await submitQuizResponses(quiz.quiz_id, {
+      idempotency_key: "replace-review-draft-submit",
+      submitted_from: "test"
+    });
+
+    // [AI -> Server] Store an initial subset review draft for the first response.
+    await createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "replace-review-draft-first",
+      summary: {},
+      items: [{
+        response_id: firstResponse.response_id,
+        outcome: "answered",
+        overall_feedback: "First response reviewed.",
+        review_rating: "Good",
+        evidence_score: 0.6,
+        topic_evidence: [{ topic_id: "replace_review_draft_topic", evidence_strength: 0.6, coverage_signal: 0.2 }]
+      }]
+    });
+    expect((await getResponse(firstResponse.response_id)).response.response_state).toBe("review_drafted");
+
+    // [AI -> Server] Replace the draft with a different subset.
+    await createReviewDraft(quiz.quiz_id, {
+      idempotency_key: "replace-review-draft-second",
+      summary: {},
+      items: [{
+        response_id: secondResponse.response_id,
+        outcome: "answered",
+        overall_feedback: "Second response reviewed.",
+        review_rating: "Hard",
+        evidence_score: 0.5,
+        topic_evidence: [{ topic_id: "replace_review_draft_topic", evidence_strength: 0.5, coverage_signal: 0.2 }]
+      }]
+    });
+
+    expect((await getResponse(firstResponse.response_id)).response.response_state).toBe("submitted");
+    expect((await getResponse(secondResponse.response_id)).response.response_state).toBe("review_drafted");
+  });
+
+  it("blocks empty finalization and handles excluded items without learner-model updates", async () => {
+    // [AI -> Server] Empty review drafts can be staged but cannot be finalized.
+    const empty = await createSubmittedSingleItemQuiz({
+      topicSlug: "empty_finalization_topic",
+      questionSlug: "empty_finalization_question",
+      submitKey: "empty-finalization-submit"
+    });
+    await createReviewDraft(empty.quiz.quiz_id, {
+      idempotency_key: "empty-finalization-draft",
+      summary: {},
+      items: []
+    });
+    await expect(finalizeReviewDraft(empty.quiz.quiz_id, { idempotency_key: "empty-finalization-finalize" })).rejects.toThrow(/empty review draft/);
+
+    // [AI -> Server] Excluded items may omit rating/evidence and may carry a re-review flag.
+    const excluded = await createSubmittedSingleItemQuiz({
+      topicSlug: "excluded_finalization_topic",
+      questionSlug: "excluded_finalization_question",
+      submitKey: "excluded-finalization-submit"
+    });
+    await createReviewDraft(excluded.quiz.quiz_id, {
+      idempotency_key: "excluded-finalization-draft",
+      summary: {},
+      items: [{
+        response_id: excluded.response.response_id,
+        outcome: "answered",
+        overall_feedback: "Question was invalid, so exclude it.",
+        excluded: true,
+        needs_ai_re_review: true,
+        topic_evidence: []
+      }]
+    });
+    const finalized = await finalizeReviewDraft(excluded.quiz.quiz_id, { idempotency_key: "excluded-finalization-finalize" });
+    expect(finalized.status).toBe("finalized");
+    expect(finalized.grade_results).toHaveLength(1);
+    expect(finalized.grade_results[0]?.excluded).toBe(true);
+    expect(finalized.learner_model_updates).toEqual([]);
+
+    const profile = await getTopicProfile("excluded_finalization_topic");
+    expect(profile.knowledge_score).toBe(0);
+    expect(profile.coverage_score).toBe(0);
+    expect(profile.evidence_count).toBe(0);
+
+    const dueItems = await reviewItems({ topicId: "excluded_finalization_topic", limit: 10 });
+    expect(dueItems.items).toEqual([]);
+  });
+
+  it("counts non-answer outcomes as evidence when AI supplies rating and topic evidence", async () => {
+    // [User -> AI] Learner times out on a question.
+    // [AI -> Server] AI review can still provide evidence for the missed item.
+    const timedOut = await createSubmittedSingleItemQuiz({
+      topicSlug: "timed_out_counts_topic",
+      questionSlug: "timed_out_counts_question",
+      outcome: "timed_out",
+      answerText: null,
+      submitKey: "timed-out-counts-submit"
+    });
+    await createReviewDraft(timedOut.quiz.quiz_id, {
+      idempotency_key: "timed-out-counts-draft",
+      summary: {},
+      items: [{
+        response_id: timedOut.response.response_id,
+        outcome: "timed_out",
+        overall_feedback: "Timed out before producing the definition.",
+        review_rating: "Again",
+        evidence_score: 0.6,
+        weaknesses: ["Could not produce answer under time pressure"],
+        topic_evidence: [{ topic_id: "timed_out_counts_topic", evidence_strength: 0.6, coverage_signal: 0.2 }]
+      }]
+    });
+    const finalized = await finalizeReviewDraft(timedOut.quiz.quiz_id, { idempotency_key: "timed-out-counts-finalize" });
+    expect(finalized.learner_model_updates).toHaveLength(1);
+
+    const profile = await getTopicProfile("timed_out_counts_topic");
+    expect(profile.knowledge_score).toBeGreaterThan(0);
+    expect(profile.weaknesses).toContain("Could not produce answer under time pressure");
   });
 
   it("models learner review of AI feedback and blocks finalization when re-review is needed", async () => {

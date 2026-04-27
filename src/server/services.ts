@@ -868,13 +868,45 @@ export async function createReviewDraft(quizId: string, input: {
     const quiz = assertFound(await tx.query.quizzes.findFirst({ where: eq(quizzes.id, quizId) }), "Quiz not found");
     if (quiz.status === "finalized") conflict("Cannot create a review draft for a finalized quiz");
     if (quiz.status !== "responses_submitted" && quiz.status !== "review_drafted") conflict("Quiz responses must be submitted before review draft creation");
-    const existing = await tx.query.reviewDrafts.findFirst({ where: eq(reviewDrafts.quizId, quizId) });
-    if (existing?.finalizedAt) conflict("Review draft is already finalized");
-    if (existing) await tx.delete(reviewDrafts).where(eq(reviewDrafts.id, existing.id));
-    const [draft] = await tx.insert(reviewDrafts).values({ quizId, userId: user.id, idempotencyKey: input.idempotency_key, summaryJson: input.summary ?? {} }).returning();
+    const seenResponseIds = new Set<string>();
+    const validatedItems: Array<{
+      item: (typeof input.items)[number];
+      response: typeof responses.$inferSelect;
+      topicEvidence: Array<{ topicId: string; evidenceStrength: number; coverageSignal: number }>;
+    }> = [];
     for (const item of input.items) {
+      if (seenResponseIds.has(item.response_id)) conflict("Review draft contains duplicate response IDs");
+      seenResponseIds.add(item.response_id);
       const response = assertFound(await tx.query.responses.findFirst({ where: eq(responses.id, item.response_id) }), "Response not found");
       if (response.state !== "submitted" && response.state !== "review_drafted") conflict("Only submitted responses can be reviewed");
+      const quizItem = assertFound(await tx.query.quizItems.findFirst({ where: eq(quizItems.id, response.quizItemId) }), "Quiz item not found");
+      if (quizItem.quizId !== quizId) conflict("Response does not belong to this quiz");
+      if (quizItem.outcome !== item.outcome) conflict("Review draft item outcome does not match the stored quiz item outcome");
+      const excluded = item.excluded ?? false;
+      if (!excluded && !item.review_rating) conflict("Non-excluded review draft items require a review rating");
+      if (!excluded && !item.topic_evidence?.length) conflict("Non-excluded review draft items require topic evidence");
+      const topicEvidence = [];
+      for (const evidence of item.topic_evidence ?? []) {
+        topicEvidence.push({
+          topicId: await resolveTopicId(evidence.topic_id, tx),
+          evidenceStrength: evidence.evidence_strength,
+          coverageSignal: evidence.coverage_signal
+        });
+      }
+      validatedItems.push({ item, response, topicEvidence });
+    }
+    const existing = await tx.query.reviewDrafts.findFirst({ where: eq(reviewDrafts.quizId, quizId) });
+    if (existing?.finalizedAt) conflict("Review draft is already finalized");
+    if (existing) {
+      const oldDraftItems = await tx.select({ responseId: reviewDraftItems.responseId }).from(reviewDraftItems).where(eq(reviewDraftItems.reviewDraftId, existing.id));
+      const oldResponseIds = oldDraftItems.map((item) => item.responseId);
+      if (oldResponseIds.length) {
+        await tx.update(responses).set({ state: "submitted", updatedAt: new Date() }).where(inArray(responses.id, oldResponseIds));
+      }
+      await tx.delete(reviewDrafts).where(eq(reviewDrafts.id, existing.id));
+    }
+    const [draft] = await tx.insert(reviewDrafts).values({ quizId, userId: user.id, idempotencyKey: input.idempotency_key, summaryJson: input.summary ?? {} }).returning();
+    for (const { item, response, topicEvidence } of validatedItems) {
       const [draftItem] = await tx
         .insert(reviewDraftItems)
         .values({
@@ -891,12 +923,12 @@ export async function createReviewDraft(quizId: string, input: {
           needsAiReReview: item.needs_ai_re_review ?? false
         })
         .returning();
-      for (const evidence of item.topic_evidence ?? []) {
+      for (const evidence of topicEvidence) {
         await tx.insert(reviewDraftTopicEvidence).values({
           reviewDraftItemId: draftItem.id,
-          topicId: await resolveTopicId(evidence.topic_id, tx),
-          evidenceStrength: evidence.evidence_strength,
-          coverageSignal: evidence.coverage_signal
+          topicId: evidence.topicId,
+          evidenceStrength: evidence.evidenceStrength,
+          coverageSignal: evidence.coverageSignal
         });
       }
       await tx.update(responses).set({ state: "review_drafted", updatedAt: new Date() }).where(eq(responses.id, response.id));
@@ -1006,11 +1038,20 @@ export async function finalizeReviewDraft(quizId: string, input: { idempotency_k
       const draft = assertFound(await tx.query.reviewDrafts.findFirst({ where: eq(reviewDrafts.quizId, quizId) }), "Review draft not found");
       if (await hasPendingReReview(draft.id, tx)) conflict("Review draft has items that need AI re-review");
       const draftItems = await tx.select().from(reviewDraftItems).where(eq(reviewDraftItems.reviewDraftId, draft.id));
+      if (draftItems.length === 0) conflict("Cannot finalize an empty review draft");
       const results = [];
       const updates = [];
       for (const draftItem of draftItems) {
         const response = assertFound(await tx.query.responses.findFirst({ where: eq(responses.id, draftItem.responseId) }), "Response not found");
         const quizItem = assertFound(await tx.query.quizItems.findFirst({ where: eq(quizItems.id, response.quizItemId) }), "Quiz item not found");
+        if (quizItem.quizId !== quizId) conflict("Review draft response does not belong to this quiz");
+        if (quizItem.outcome !== draftItem.outcome) conflict("Review draft item outcome does not match the stored quiz item outcome");
+        const evidenceRows = await tx.select().from(reviewDraftTopicEvidence).where(eq(reviewDraftTopicEvidence.reviewDraftItemId, draftItem.id));
+        if (!draftItem.excluded) {
+          if (draftItem.needsAiReReview) conflict("Review draft has items that need AI re-review");
+          if (!draftItem.reviewRating) conflict("Non-excluded review draft items require a review rating");
+          if (evidenceRows.length === 0) conflict("Non-excluded review draft items require topic evidence");
+        }
         const [grade] = await tx
           .insert(gradeResults)
           .values({
@@ -1027,7 +1068,6 @@ export async function finalizeReviewDraft(quizId: string, input: { idempotency_k
           })
           .returning();
         results.push({ response_id: response.id, grade_id: grade.id, outcome: draftItem.outcome, excluded: draftItem.excluded });
-        const evidenceRows = await tx.select().from(reviewDraftTopicEvidence).where(eq(reviewDraftTopicEvidence.reviewDraftItemId, draftItem.id));
         for (const evidence of evidenceRows) {
           await tx.insert(gradeTopicEvidence).values({
             gradeResultId: grade.id,
