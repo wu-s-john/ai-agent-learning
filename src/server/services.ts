@@ -823,6 +823,7 @@ export async function submitQuizResponses(quizId: string, input: { idempotency_k
 }
 
 export async function getResponse(responseId: string) {
+  if (!isUuid(responseId)) notFound(`Response not found: ${responseId}`);
   const response = assertFound(await db.query.responses.findFirst({ where: eq(responses.id, responseId) }), "Response not found");
   const item = assertFound(await db.query.quizItems.findFirst({ where: eq(quizItems.id, response.quizItemId) }), "Quiz item not found");
   return {
@@ -1190,6 +1191,7 @@ async function upsertReviewState(client: DbLike, userId: string, questionId: str
 }
 
 export async function getResponseGrades(responseId: string) {
+  if (!isUuid(responseId)) notFound(`Response not found: ${responseId}`);
   const grades = await db.select().from(gradeResults).where(eq(gradeResults.responseId, responseId));
   return { grades: grades.map((grade) => ({ grade_id: grade.id, response_id: grade.responseId, review_rating: grade.reviewRating, evidence_score: grade.evidenceScore, overall_feedback: grade.overallFeedback, excluded: grade.excluded, created_at: grade.createdAt })) };
 }

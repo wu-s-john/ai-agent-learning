@@ -922,6 +922,13 @@ describe("User-AI-Server integration workflows", () => {
     expect(targetActivity.items.some((item) => item.entity_id === other.quiz.quiz_id)).toBe(false);
   });
 
+  it("rejects malformed response IDs before querying uuid columns", async () => {
+    // [Client -> Server] Bad dynamic response IDs should produce clean not-found errors,
+    // not database uuid parse failures that become 500s in HTTP routes.
+    await expect(getResponse("not-a-uuid")).rejects.toThrow(/Response not found: not-a-uuid/);
+    await expect(getResponseGrades("not-a-uuid")).rejects.toThrow(/Response not found: not-a-uuid/);
+  });
+
   it("models learner review of AI feedback and blocks finalization when re-review is needed", async () => {
     // [User -> AI] "Quiz me on bases for topology."
     // [AI -> Server] Create a quiz and persist the learner's answer.
