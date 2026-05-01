@@ -28,18 +28,37 @@ The `/docs` folder has the product and API design details:
 
 ## Quick Start
 
+Local Docker workflow:
+
 ```bash
 pnpm install
-pnpm db:up
-pnpm db:migrate
-pnpm db:seed
-pnpm dev
+just db-up-local
+just db-migrate-local
+just db-seed-local
+just dev
 ```
 
-The local database runs at:
+The local development database runs at:
 
 ```text
 postgres://learning:learning@localhost:54329/learning
+```
+
+The local test database runs at:
+
+```text
+postgres://learning:learning@localhost:54330/learning
+```
+
+See [`docs/aws-rds.md`](docs/aws-rds.md) for the AWS RDS production deployment,
+migration, and release command flow.
+
+Production commands use 1Password refs hydrated into local `.env`:
+
+```bash
+just load-dev-token
+just setup-env
+just check-env-prod
 ```
 
 ## Verification
@@ -54,10 +73,7 @@ pnpm build
 Integration workflow checks:
 
 ```bash
-pnpm db:test:up
-pnpm db:test:reset
-pnpm db:test:migrate
-pnpm test
+just test
 ```
 
 This repo intentionally uses integration tests only. The tests connect to real Postgres on `localhost:54330` and model the `User -> AI -> Server` workflows described in [`docs/design.md`](docs/design.md).
@@ -78,13 +94,12 @@ The development database remains separate on `localhost:54329`, so test resets d
 ## Useful Scripts
 
 ```bash
-pnpm db:up       # start pgvector Postgres
-pnpm db:test:up  # start isolated test Postgres on localhost:54330
-pnpm db:down     # stop Postgres
-pnpm db:reset    # drop/recreate public schema
-pnpm db:test:reset # drop/recreate the test public schema
-pnpm db:migrate  # apply SQL migrations
-pnpm db:test:migrate # apply SQL migrations to test Postgres
-pnpm db:seed     # seed local learner, topics, and sample questions
-pnpm test        # run DB-backed User-AI-Server integration tests
+just db-up-local       # start local dev Postgres on localhost:54329
+just db-up-test        # start local test Postgres on localhost:54330
+just db-migrate-local  # apply SQL migrations to local dev
+just db-migrate-test   # apply SQL migrations to local test
+just db-seed-local     # seed local learner, topics, and sample questions
+just test              # run DB-backed integration tests against local test DB
+just load-dev-token    # seed local access to ai-agent-army-dev secrets
+just setup-env         # hydrate prod/RDS env refs into .env
 ```

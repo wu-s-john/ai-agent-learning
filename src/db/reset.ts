@@ -1,6 +1,12 @@
 import postgres from "postgres";
+import { resolveDatabaseUrl } from "./url";
 
-const connectionString = process.env.DATABASE_URL ?? "postgres://learning:learning@localhost:54329/learning";
+const databaseTarget = process.env.DB_TARGET ?? "unknown";
+if (databaseTarget === "prod" && process.env.CONFIRM_PROD_DATABASE_RESET !== "reset-prod") {
+  throw new Error("Refusing to reset prod. Set CONFIRM_PROD_DATABASE_RESET=reset-prod to override.");
+}
+
+const connectionString = resolveDatabaseUrl();
 const client = postgres(connectionString, { max: 1, prepare: false });
 
 async function main() {

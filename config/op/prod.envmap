@@ -1,0 +1,23 @@
+# Safe to commit: these are 1Password references and non-secret defaults, not live secrets.
+
+DB_TARGET=prod
+PGHOST=op://ai-agent-army-dev/learning-postgres-prod-app/hostname
+PGPORT=op://ai-agent-army-dev/learning-postgres-prod-app/port
+PGDATABASE=op://ai-agent-army-dev/learning-postgres-prod-app/database
+PGUSER=op://ai-agent-army-dev/learning-postgres-prod-app/username
+PGPASSWORD=op://ai-agent-army-dev/learning-postgres-prod-app/password
+PGSSLMODE=op://ai-agent-army-dev/learning-postgres-prod-app/sslmode
+
+POSTGRES_ADMIN_HOST=op://ai-agent-army-dev/learning-postgres-prod-admin/hostname
+POSTGRES_ADMIN_PORT=op://ai-agent-army-dev/learning-postgres-prod-admin/port
+POSTGRES_ADMIN_DATABASE=op://ai-agent-army-dev/learning-postgres-prod-admin/database
+POSTGRES_ADMIN_USER=op://ai-agent-army-dev/learning-postgres-prod-admin/username
+POSTGRES_ADMIN_PASSWORD=op://ai-agent-army-dev/learning-postgres-prod-admin/password
+POSTGRES_ADMIN_SSLMODE=op://ai-agent-army-dev/learning-postgres-prod-admin/sslmode
+
+DEFAULT_USER_EMAIL=prod@ai-agent-learning.test
+DEFAULT_USER_DISPLAY_NAME=Prod Learner
+EMBEDDING_PROVIDER=fake
+EMBEDDING_MODEL=fake-embedding-1536
+EMBEDDING_DIMENSIONS=1536
+DB_POOL_SIZE=10

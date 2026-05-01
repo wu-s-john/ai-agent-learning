@@ -1,8 +1,9 @@
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import * as schema from "./schema";
+import { resolveDatabaseUrl } from "./url";
 
-const connectionString = process.env.DATABASE_URL ?? "postgres://learning:learning@localhost:54329/learning";
+const connectionString = resolveDatabaseUrl();
 
 export const sqlClient = postgres(connectionString, {
   max: Number(process.env.DB_POOL_SIZE ?? 10),

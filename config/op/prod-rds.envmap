@@ -1,0 +1,16 @@
+# Safe to commit. Used only by `just deploy-prod-db`.
+# Put VPC-specific values in the referenced 1Password item or replace them with literals.
+
+AWS_REGION=us-east-1
+RDS_STACK_NAME=ai-agent-learning-prod-rds
+RDS_INSTANCE_IDENTIFIER=ai-agent-learning-prod
+RDS_ENGINE_VERSION=
+RDS_DB_INSTANCE_CLASS=db.t4g.small
+RDS_ALLOCATED_STORAGE=20
+RDS_MAX_ALLOCATED_STORAGE=100
+RDS_BACKUP_RETENTION_DAYS=7
+RDS_MULTI_AZ=false
+RDS_DELETION_PROTECTION=true
+RDS_PUBLICLY_ACCESSIBLE=false
+RDS_SUBNET_GROUP_NAME=op://ai-agent-army-dev/learning-rds-prod-config/db-subnet-group-name
+RDS_SECURITY_GROUP_IDS=op://ai-agent-army-dev/learning-rds-prod-config/vpc-security-group-ids

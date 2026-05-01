@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: RDS PostgreSQL database for ai-agent-learning.
+
+Parameters:
+  DBInstanceIdentifier:
+    Type: String
+  DBName:
+    Type: String
+  EngineVersion:
+    Type: String
+    Default: ""
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 100
+  DBSubnetGroupName:
+    Type: String
+  VpcSecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  PubliclyAccessible:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+  MultiAZ:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  DeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  HasEngineVersion: !Not [!Equals [!Ref EngineVersion, ""]]
+
+Resources:
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Ref DBInstanceIdentifier
+      Engine: postgres
+      EngineVersion: !If [HasEngineVersion, !Ref EngineVersion, !Ref AWS::NoValue]
+      DBName: !Ref DBName
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      ManageMasterUserPassword: true
+      MasterUsername: postgres
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      DBSubnetGroupName: !Ref DBSubnetGroupName
+      VPCSecurityGroups: !Ref VpcSecurityGroupIds
+      PubliclyAccessible: !Equals [!Ref PubliclyAccessible, "true"]
+      MultiAZ: !Equals [!Ref MultiAZ, "true"]
+      DeletionProtection: !Equals [!Ref DeletionProtection, "true"]
+
+Outputs:
+  EndpointAddress:
+    Value: !GetAtt Database.Endpoint.Address
+  EndpointPort:
+    Value: !GetAtt Database.Endpoint.Port
+  MasterSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn

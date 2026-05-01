@@ -2,11 +2,12 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { resolveDatabaseUrl } from "./url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "../..");
 const migrationsDir = path.join(root, "drizzle");
-const connectionString = process.env.DATABASE_URL ?? "postgres://learning:learning@localhost:54329/learning";
+const connectionString = resolveDatabaseUrl();
 
 const client = postgres(connectionString, { max: 1, prepare: false });
 
